@@ -1,0 +1,861 @@
+---
+title: "Create tidy data ready for analysis of study on Infections and Frailty in CPRD-UK"
+format: html
+author: Kwabena Asare
+toc: true
+toc-location: left
+number-sections: true
+date: "`r lubridate::today()`"
+tbl-cap-location: top
+editor_options: 
+  chunk_output_type: console
+execute: 
+  include: true
+  echo: false
+editor: 
+  markdown: 
+    wrap: 72
+---
+
+## Function to define covariates/variables with codelist
+
+# objects needed
+1. A codelist that defines the variable. 
+  
+  -The codelist should have 2 main columns; 
+  - The code; ICD, SNOWMED etc
+  - The description; 
+  
+2. A dataset of observations/individuals; **This is the observation file**
+  the data set should have 2 main variables;
+
+  - The patid; unique identifier of each observation
+  - The medical code; all medical codes that represent any observation such as diagnosis or race/ethnicity in the EHR
+
+3. Approach. for each codelist, join the codelist and obsertion file using the medical code as join key
+  - then the description column from the codelist will now be the new variable.
+  
+```{r function_to_def_covariate}
+
+# create a function
+# Arguments of the function
+# 1. data_files = list of files that contain the data sets;these are the observation files from CPRD
+# 2. codelist = a list of codes that define a particular medical observation such as diagnosis
+# codelist has code and description
+# 3. days_look_back = What range of look back in time should be used to select the cohort_entry observation
+# Ever look back for most variables based on study protocol; 
+# other default variables
+  # medcodeid = the code
+  # term= description of code 
+
+def_covariate <- function(data_files = observations,codelist) {
+  
+  data <- map(data_files, .progress = TRUE,function(x) {
+    #
+      collect(x) |>
+      fselect(patid,medcodeid,obsdate) |>
+      fmutate(obsdate = as.Date(obsdate,format="%d/%m/%Y")) |>
+      join(select(collect(codelist),medcodeid,term),
+       how = "inner",
+       on="medcodeid") |> 
+      fselect(patid,term,obsdate)}) |> reduce(rowbind)
+  # 
+  data |>
+    funique(cols = c("patid","obsdate")) |>
+    join(fselect(collect(cohort_matched_2), patid,setid,indexdate,enddate),
+         how = "left",
+         on = "patid",
+         multiple =  TRUE) |> # patids appearing as both exposed and unexposed
+    # below is important for patids appearing as both exposed and un-exposed but with diff indexdate
+    # filter observations from the lookback to the indexdate
+    fsubset(obsdate <= indexdate) |>
+    funique(cols=c("patid","setid","obsdate")) |>
+    fselect(patid,setid,obsdate,term) |>
+    group_by(patid,setid) |>
+    arrange(obsdate,.by_group = T) |>
+    slice_tail() |> # to take the most recent obsdate
+    ungroup() |>
+    fselect(patid,setid,term)
+}
+```
+
+## Exposure: severe infections type and site 
+
+```{r exposure_tidy}
+# create infection type category
+# create infection site category
+
+#
+  collect(cohort_matched_2) |>
+  fselect(patid,setid,ICD,exposed) |>
+  join(distinct(mutate(infection_codelist, ICD=str_sub(`ICD-10 code`,1,5)),ICD,.keep_all = T),on ="ICD",how="left") |> 
+  # infection type
+  fmutate(inf_type = case_when(bacterial %in% "1" ~ "bacterial",
+                              viral %in% "1" ~ "viral",
+                              fungal %in% "1" ~ "fungal",
+                              parasitic %in% "1" ~ "parasitic")) |>
+  # infection site
+  fmutate(inf_site = case_when(sepsis %in% 1 ~ "sepsis",
+                              uti %in% 1 ~ "uti",
+                              ssti %in% 1 ~ "ssti",
+                              mening_enceph %in% 1 ~ 'mening_enceph',
+                              lrti %in% 1 ~ 'lrti',
+                              gastro %in% 1 ~ 'gastro')) |>
+  # infection type and site of setid; matchedd group
+  group_by(setid) |>
+  arrange(exposed,.by_group = T) |> # this puts exposed = 1 as the last obs among same setid
+  fmutate(inf_type_of_match_grp = last(inf_type),.after = inf_type) |>
+  fmutate(inf_site_of_match_grp = last(inf_site),.after = inf_site) |>
+  ungroup() |>
+  fselect(patid,setid,inf_type_of_match_grp,inf_site_of_match_grp) 
+```
+
+## Covariates defined with codes  
+
+```{r ethnicity_tidy}
+#
+ethnicity_data <- def_covariate(data_files = observations,codelist = ethnicity_codes) |>
+  to_duckdb(con=my_con_integer64)
+#
+collect(ethnicity_data) |>
+  join(select(collect(cohort_matched_2),patid,setid),on=c("patid","setid"),how="full") |>
+  fmutate(ethnicity = if_else(term %in% c("5. Not Stated","") | is.na(term),
+                                  "Missing",term)) 
+```
+
+```{r alcohol_use_tidy}
+#
+  alcohol_data <- def_covariate(data_files = observations,codelist = alcohol_codes) |>
+  to_duckdb(con=my_con_integer64)
+#
+  collect(alcohol_data) |>
+  join(select(collect(cohort_matched_2),patid,setid),on=c("patid","setid"),how="full") |>
+  fmutate(harmful_alcohol_use = if_else(!is.na(term),1,0)) 
+```
+
+```{r smoking_tidy}
+#
+ smoking_data <- def_covariate(data_files = observations,codelist = smoking_codes) |>
+  to_duckdb(con=my_con_integer64)
+
+#
+  collect(smoking_data) |>
+  fmutate(smoking = case_when(str_detect(term,"(ex|EX|Ex|eX|[Ss]topped|ceased).*[Ss]mok") ~"2.Ex-smoker",
+                                       str_detect(term,"([Nn]ever|[Nn]on).*[sS]mok") ~"1.Non-smoker",
+                                       .default = "3.Current smoker")) |>
+  join(select(collect(cohort_matched_2),patid,setid),on=c("patid","setid"),how="full") |>
+  fmutate(smoking =if_else(is.na(smoking),"Missing",smoking)) 
+```
+
+```{r dementia_tidy}
+#  
+dementia_data <- def_covariate(data_files = observations,codelist = dementia_codes)  |>
+  to_duckdb(con=my_con_integer64)
+#
+  collect(dementia_data) |>
+  join(select(collect(cohort_matched_2),patid,setid),on=c("patid","setid"),how="full") |>
+  fmutate(dementia = if_else(!is.na(term),1,0)) 
+```
+
+```{r diabetes_tidy}
+# 
+ diabetes_data <- def_covariate(data_files = observations,codelist = diabetes_codes) |>
+  to_duckdb(con=my_con_integer64)
+#
+  collect(diabetes_data) |>
+  join(select(collect(cohort_matched_2),patid,setid),on=c("patid","setid"),how="full") |>
+  fmutate(diabetes = if_else(!is.na(term),1,0)) 
+```
+
+```{r care_home_residency_tidy}
+#
+ care_home_residency_data <- def_covariate(data_files = observations,codelist = care_home_residency_codes) |>
+  to_duckdb(con=my_con_integer64)
+#
+collect(care_home_residency_data) |>
+  join(select(collect(cohort_matched_2),patid,setid),on=c("patid","setid"),how="full") |>
+  fmutate(care_home_residency = if_else(!is.na(term),1,0)) 
+```
+
+```{r demographics_tidy}
+
+# create follow-up duration variable
+# aka survival time in days
+  cohort_matched_2 |> 
+  collect() |>
+  left_join(transmute(practice_imd,pracid,e2019_imd_5_prac=e2019_imd_5),join_by(pracid)) |>
+  left_join(transmute(patient_2019_imd,patid,e2019_imd_5_pat=e2019_imd_5),join_by(patid )) |>
+  fmutate(person_time_days = as.numeric(enddate-indexdate),
+         person_time_years = as.numeric(enddate-indexdate)/365) |>
+  fmutate(censored_yr1 = if_else(person_time_days > 0, 0,1),
+         censored_yr2 = if_else(person_time_days > 365, 0,1),
+         censored_yr3 = if_else(person_time_days > 365*2, 0,1),
+         censored_yr4 = if_else(person_time_days > 365*3, 0,1),
+         censored_yr5 = if_else(person_time_days > 365*4, 0,1)) |>
+  # break down censoring into death, lcd/regenddate, study_end_date
+  # create only 2 levels, death or others since dates can coincide
+    fmutate(follow_up_yr1 = case_when(censored_yr1 == 1 & enddate == cprd_ddate ~ "Died",
+                                      censored_yr1 == 1 & (is.na(cprd_ddate) | enddate != cprd_ddate)  ~ "lcd_regenddate_studyend",
+                                      .default = "Active"),
+         follow_up_yr2 = case_when(censored_yr2 == 1 & enddate== cprd_ddate ~ "Died",
+                                      censored_yr2 == 1 & (is.na(cprd_ddate) | enddate != cprd_ddate)   ~ "lcd_regenddate_studyend",
+                                      .default = "Active"),
+         follow_up_yr3 = case_when(censored_yr3 == 1 & enddate== cprd_ddate ~ "Died",
+                                      censored_yr3 == 1 & (is.na(cprd_ddate) | enddate != cprd_ddate)   ~ "lcd_regenddate_studyend",
+                                      .default = "Active"),
+         follow_up_yr4 = case_when(censored_yr4 == 1 & enddate== cprd_ddate ~ "Died",
+                                      censored_yr4 == 1 & (is.na(cprd_ddate) | enddate != cprd_ddate)   ~ "lcd_regenddate_studyend",
+                                      .default = "Active"),
+         follow_up_yr5 = case_when(censored_yr5 == 1 & enddate== cprd_ddate ~ "Died",
+                                      censored_yr5 == 1 & (is.na(cprd_ddate) | enddate != cprd_ddate)   ~ "lcd_regenddate_studyend",
+                                      .default = "Active")) |>
+  # Ag3
+  fmutate(age_bl = (year(indexdate)-yob),
+         ageout = (year(enddate)-yob)) |>
+  fmutate(age_bl_cat4 = cut(age_bl,breaks=c(65,70,80,90,Inf),include.lowest=T,
+                     labels=c("1.65-70","2.71-80","3.81-90","4.>90")),
+         ageout_cat4 = cut(ageout,breaks=c(65,70,80,90,Inf),include.lowest=T,
+                     labels=c("1.65-70","2.71-80","3.81-90","4.>90"))) |>
+  # Gender
+ fmutate(gender = case_when(gender ==1 ~ "Male",gender==2 ~ "Female")) |>
+ # IMD
+ # if e2019_imd_5_pat available use it otherwise take e2019_imd_5_prac 
+ # e2019_imd_5_pat  = patient level IMD
+ # e2019_imd_5_prac = practice level IMD
+  fmutate(e2019_imd = coalesce(e2019_imd_5_pat,e2019_imd_5_prac),.after = e2019_imd_5_prac) |>
+  fmutate(e2019_imd_cat = case_when(e2019_imd ==1 ~"1, least deprived",
+                                   e2019_imd ==2~"2, 2nd quintile",
+                                   e2019_imd ==3~"3, 3rd quintile",
+                                   e2019_imd ==4~"4, 4th quintile",
+                                   e2019_imd ==5~"5, Most deprived")) |>
+  select(patid,setid,person_time_days,person_time_years,matches("censored|follow_up"),
+          age_bl,ageout,age_bl_cat4,ageout_cat4,gender,e2019_imd,e2019_imd_cat) 
+```
+
+```{r lookback_gp_infections_tidy}
+
+ map(observations,.progress = TRUE,function(x) {
+    #
+      collect(x) |>
+      fselect(patid,medcodeid,obsdate) |>
+      fmutate(obsdate = as.Date(obsdate,format="%d/%m/%Y")) |>
+      join(collect(gp_infection_codes) |> select(medcodeid),
+       how = "inner",
+       on="medcodeid") |> 
+      fselect(patid,obsdate)}) |> reduce(rowbind) |>
+    funique(cols = c("patid","obsdate")) |>
+    join(fselect(collect(cohort_matched_2), patid,setid,indexdate,enddate),
+         how = "left",
+         on = "patid",
+         multiple =  TRUE) |> 
+    fsubset(obsdate>indexdate-1835 & obsdate <= indexdate) |>
+    funique(cols=c("patid","setid","obsdate")) |>
+    group_by(patid,setid) |>
+    fmutate(gp_infection_5yr_lookback = case_when(any(obsdate > indexdate-1835 & obsdate <= indexdate) ~ 1),
+            gp_infection_7dy_lookback = case_when(any(obsdate > indexdate-7 & obsdate <= indexdate) ~ 1)) |>
+    ungroup() |>
+    funique(cols=c("patid","setid")) |>
+    fselect(patid,setid,gp_infection_5yr_lookback,gp_infection_7dy_lookback) |>
+    join(select(collect(cohort_matched_2),patid,setid),on=c("patid","setid"),how="full") |>
+    fmutate(gp_infection_5yr_lookback = if_else(!is.na(gp_infection_5yr_lookback),1,0),
+         gp_infection_7dy_lookback = if_else(!is.na(gp_infection_7dy_lookback),1,0)) 
+
+```
+
+CPRD antibiotic definition
+
+```{r antibio_7dy_lookbck}
+
+  map(drugissues,.progress = T,function(x) {
+      collect(x) |>
+      fselect(patid,issuedate,prodcodeid) |>
+      fmutate(issuedate=as.Date(issuedate,"%d/%m/%Y")) |>
+      join(collect(aurum_product_dictionary),on=c("prodcodeid"),how="inner") |> 
+      fsubset(ProductName %in% antimicrobials) |>
+      join(select(collect(cohort_matched_2),patid,setid,indexdate,enddate),
+       on=c("patid"),
+       how="left",
+       multiple = TRUE) |>
+      fsubset(issuedate > indexdate-7 & issuedate <= indexdate)}) |>
+  reduce(rowbind) |>
+  funique(cols = c("patid","issuedate")) |>
+    # create antibio_7dy_lookbck; outpatient antibiotic prescription 7 days before cohort entry
+  fmutate(antibio_7dy_lookbck = 1) |>
+  # set missing antibio_7dy_lookbck to 0
+  join(select(collect(cohort_matched_2),patid,setid),
+       on=c("patid","setid"),
+       how="full",
+       multiple = TRUE) |>
+  fmutate(antibio_7dy_lookbck = if_else(antibio_7dy_lookbck==1,1,0,missing=0)) |>
+  funique(cols = c("patid","setid")) |>
+  fselect(patid,setid,antibio_7dy_lookbck) 
+```
+
+```{r consultations_inyear_before_cohort_entry}
+ map(consultations,.progress = T,function(x) {
+  collect(x)|> 
+  fselect(patid,consdate) |>
+  fmutate(consdate = as.Date(consdate,format="%d/%m/%Y")) |>
+     # allow 1 yr before indexdate
+     # add obs with no consultation dates; leave consultations == 0
+     join(fselect(collect(cohort_matched_2),patid,setid,indexdate),
+         on ="patid",
+         how="left",
+         multiple = TRUE) |>
+     fsubset(consdate > indexdate-365 & consdate < indexdate) |>
+     fmutate(one_consult_1y_lookbck = if_else(consdate > indexdate-365 & consdate < indexdate,1,0)) |>
+     fselect(patid,setid,one_consult_1y_lookbck) |>
+     group_by(patid,setid) |>
+     arrange(one_consult_1y_lookbck,.by_group = T) |>
+     slice(1) |>
+     ungroup()
+     }) |> 
+  reduce(rowbind) |>
+  # join full and set missing one_consult_1y_lookbck to NA
+  join(fselect(collect(cohort_matched_2),patid,setid),
+         on =c("patid","setid"),
+         how="full",
+         multiple = TRUE) |>
+  fmutate(one_consult_1y_lookbck=if_else(is.na(one_consult_1y_lookbck),0,one_consult_1y_lookbck)) 
+```
+
+## Outcome: eFI data
+## Frailty data 1: Create eFI deficits at baseline/indexdate and at years 1, 2, 3, 4, and 5
+
+Approach:
+1. Start with observation file
+2. Join observation file with codelist on medcodeid,
+3. If code matches, deficit = 1, otherwise deficit = 0
+4. If patid censored, deficit = NA otherwise bullet 3
+5. First define eFI at index date and update at each ff-up if a new deficit is recorded, 
+otherwise maintain previous eFI
+6. 36 deficits in total, 35 are are commordities/health etc defined with codelist and 
+poypharmacy defined by counting number of prescribed medicines in BNF chapters 1-15 
+
+### 35 eFI deficits
+
+```{r 35_eFI_deficits}
+
+# 35 eFI deficits data 
+# Objects needed
+
+# file paths to codelist
+# use list.files() function to get the list of file paths
+eFI_deficits_codelists_file_paths
+
+# a vector of the names of deficits
+deficits_names <- map_chr(eFI_deficits_codelists_file_paths, ~str_extract(.x,pattern = "(.*/)(.*)( .* codelist.csv$)",group = 2))
+ 
+# a named list of the codelists
+deficits_code_list <- setNames(map(eFI_deficits_codelists_file_paths, ~unique(pull(collect(open_csv_dataset(.x)),medcodeid))),
+                              deficits_names)
+# all codelits combined: vector
+deficits_code_df <- map(deficits_code_list,~as.data.frame(.x)) |> reduce(rowbind) |>
+  rename_with(~"medcodeid")
+
+# define deficit based on codelist
+# iterate the ff code on the observation files and combine result into a data set of the 35 deficits
+
+  map(observations,.progress = TRUE,function(x) {
+  
+  collect(x) |> 
+    fselect(patid,obsdate,medcodeid) |>
+    funique(cols=c("patid","obsdate","medcodeid")) |>
+    fmutate(obsdate = as.Date(obsdate,format="%d/%m/%Y")) |>
+    fsubset(medcodeid %in% deficits_code_df$medcodeid) |>
+    fmutate(deficit_name=case_when(medcodeid %in% deficits_code_list[[1]] ~ deficits_names[[1]],
+                              medcodeid %in% deficits_code_list[[2]] ~ deficits_names[[2]],
+                              medcodeid %in% deficits_code_list[[3]] ~ deficits_names[[3]],
+                              medcodeid %in% deficits_code_list[[4]] ~ deficits_names[[4]],
+                              medcodeid %in% deficits_code_list[[5]] ~ deficits_names[[5]],
+                              medcodeid %in% deficits_code_list[[6]] ~ deficits_names[[6]],
+                              medcodeid %in% deficits_code_list[[7]] ~ deficits_names[[7]],
+                              medcodeid %in% deficits_code_list[[8]] ~ deficits_names[[8]],
+                              medcodeid %in% deficits_code_list[[9]] ~ deficits_names[[9]],
+                              medcodeid %in% deficits_code_list[[10]] ~ deficits_names[[10]],
+                              medcodeid %in% deficits_code_list[[11]] ~ deficits_names[[11]],
+                              medcodeid %in% deficits_code_list[[12]] ~ deficits_names[[12]],
+                              medcodeid %in% deficits_code_list[[13]] ~ deficits_names[[13]],
+                              medcodeid %in% deficits_code_list[[14]] ~ deficits_names[[14]],
+                              medcodeid %in% deficits_code_list[[15]] ~ deficits_names[[15]],
+                              medcodeid %in% deficits_code_list[[16]] ~ deficits_names[[16]],
+                              medcodeid %in% deficits_code_list[[17]] ~ deficits_names[[17]],
+                              medcodeid %in% deficits_code_list[[18]] ~ deficits_names[[18]],
+                              medcodeid %in% deficits_code_list[[19]] ~ deficits_names[[19]],
+                              medcodeid %in% deficits_code_list[[20]] ~ deficits_names[[20]],
+                              medcodeid %in% deficits_code_list[[21]] ~ deficits_names[[21]],
+                              medcodeid %in% deficits_code_list[[22]] ~ deficits_names[[22]],
+                              medcodeid %in% deficits_code_list[[23]] ~ deficits_names[[23]],
+                              medcodeid %in% deficits_code_list[[24]] ~ deficits_names[[24]],
+                              medcodeid %in% deficits_code_list[[25]] ~ deficits_names[[25]],
+                              medcodeid %in% deficits_code_list[[26]] ~ deficits_names[[26]],
+                              medcodeid %in% deficits_code_list[[27]] ~ deficits_names[[27]],
+                              medcodeid %in% deficits_code_list[[28]] ~ deficits_names[[28]],
+                              medcodeid %in% deficits_code_list[[29]] ~ deficits_names[[29]],
+                              medcodeid %in% deficits_code_list[[30]] ~ deficits_names[[30]],
+                              medcodeid %in% deficits_code_list[[31]] ~ deficits_names[[31]],
+                              medcodeid %in% deficits_code_list[[32]] ~ deficits_names[[32]],
+                              medcodeid %in% deficits_code_list[[33]] ~ deficits_names[[33]],
+                              medcodeid %in% deficits_code_list[[34]] ~ deficits_names[[34]],
+                              medcodeid %in% deficits_code_list[[35]] ~ deficits_names[[35]])) |>
+    fselect(patid,obsdate,deficit_name) |>
+    fmutate(deficit_yes_no = case_when(!is.na(deficit_name) ~ 1)) |>
+    join(fselect(collect(cohort_matched_2),patid,setid,indexdate,enddate),
+         on = "patid",
+         how ="left",
+         multiple = TRUE) |> # patids appearing as both exposed and unexposed
+    fsubset(obsdate > as.Date(-Inf) & obsdate <= indexdate+1825) |>
+    fmutate(time_point = case_when(obsdate > as.Date(-Inf) & obsdate <= indexdate-14 ~ "bl",
+                                   obsdate > indexdate & obsdate <= indexdate+365 ~ "yr1",
+                                   obsdate > indexdate+365 & obsdate <= indexdate+730 ~ "yr2",
+                                   obsdate > indexdate+730 & obsdate <= indexdate+1095 ~ "yr3",
+                                   obsdate > indexdate+1095 & obsdate <= indexdate+1460 ~ "yr4",
+                                   obsdate > indexdate+1460 & obsdate <= indexdate+1825 ~ "yr5")) |>
+    fsubset(!is.na(time_point)) |>
+    funique(cols=c("patid","setid","deficit_name","time_point")) |>
+    fselect(patid,setid,deficit_yes_no,deficit_name,time_point) |>
+    pivot_wider(names_from = c(deficit_name,time_point),
+                values_from = deficit_yes_no,
+                names_glue = "{deficit_name}_{time_point}",
+                values_fill = NA) 
+  }) |> # the result of this is a list
+  reduce(rowbind,fill=T) |> 
+  # some observations will not match any deficit; add them 
+  join(fselect(collect(cohort_matched_2),patid,setid,indexdate,enddate),
+         on = c("patid","setid"),
+         how ="full") |>
+  fmutate(person_time_days = as.numeric(enddate - indexdate)) |>
+  # create deficits: approach -1
+  # first create eFI at cohort entry (1 or 0)
+  # then if new deficit recorded at ff-up, 1, otherwise, previous/lag deficit
+  mutate(across(matches(glue("{deficits_names}")),~ if_else(is.na(.x),0,.x))) |> # all deficits over time
+  mutate(across(matches(glue("{deficits_names}_yr1")),~ if_else(.x==1,.x,get(glue("{str_replace(cur_column(),'yr1','bl')}"))))) |>
+  mutate(across(matches(glue("{deficits_names}_yr2")),~ if_else(.x==1,.x,get(glue("{str_replace(cur_column(),'yr2','yr1')}"))))) |>
+  mutate(across(matches(glue("{deficits_names}_yr3")),~ if_else(.x==1,.x,get(glue("{str_replace(cur_column(),'yr3','yr2')}"))))) |>
+  mutate(across(matches(glue("{deficits_names}_yr4")),~ if_else(.x==1,.x,get(glue("{str_replace(cur_column(),'yr4','yr3')}"))))) |>
+  mutate(across(matches(glue("{deficits_names}_yr5")),~ if_else(.x==1,.x,get(glue("{str_replace(cur_column(),'yr5','yr4')}"))))) |>
+  # If not censored and no match for deficit code, deficit = 0
+  # If censored, deficit = NA
+  mutate(across(matches(glue("{deficits_names}_yr1")),~ if_else(person_time_days > 0,.x,NA_integer_))) |>
+  mutate(across(matches(glue("{deficits_names}_yr2")),~ if_else(person_time_days > 365,.x,NA_integer_))) |>
+  mutate(across(matches(glue("{deficits_names}_yr3")),~ if_else(person_time_days > 730,.x,NA_integer_)))|>
+  mutate(across(matches(glue("{deficits_names}_yr4")),~ if_else(person_time_days > 1095,.x,NA_integer_)))|>
+  mutate(across(matches(glue("{deficits_names}_yr5")),~ if_else(person_time_days > 1460,.x,NA_integer_))) 
+   
+  #
+  eFI_35_deficits_data |>
+  # NOTE: particpant could have observations recorded in different observation files
+  # this can create duplicate deficit by time_point; thus if deficit is recorded within same time_point but in different observation files
+  # so (use max deficit) by time_point
+  group_by(patid,setid) |>
+     mutate(across(ends_with("bl|yr[1-5]"),~max(.x,na.rm = T))) |>
+     ungroup() |>
+    funique(cols=c("patid","setid")) 
+    
+```
+
+### Polypharmacy eFI deficit
+
+1. Create polypharmacy deficit from drug files
+2. Define polypharmacy as ≥5 unique prescribed medications, using chapters 1–15 of the British National Formulary
+define polypharmacy within one year intervals; CPRD study:https://www.cprd.com/approved-studies/redefining-polypharmacy-population-based-longitudinal-study-using-electronic
+
+Approach:
+
+1. Start with drugsssue files
+2. Filter product codes in aurum product dictionary
+3. Create study time points
+4. Within each time interval, count n_distinct BNFChapters
+5. If n>=5 plypharmacy==1 otherwise 0
+
+```{r eFI_deficit_polypharmacy}
+
+# Iterate the ff code on the drug issue files
+map(drugissues,.progress = T,function(x) {
+      collect(x)|>
+      fselect(patid,issuedate,prodcodeid) |>
+      fmutate(issuedate=as.Date(issuedate,"%d/%m/%Y")) |>
+      join(collect(aurum_product_dictionary),on=c("prodcodeid"),how="inner") |> 
+      fsubset(!is.na(BNFChapter)) |>
+      join(select(collect(cohort_matched_2),patid,setid,indexdate,enddate),
+       on=c("patid"),
+       how="left",
+       multiple = TRUE) |>
+  # create polypharmacy deficit
+    fmutate(time_point = case_when(issuedate > as.Date(-Inf) & issuedate <= indexdate-14 ~ "bl",
+                                   issuedate > indexdate & issuedate <= indexdate+365 ~ "yr1",
+                                   issuedate > indexdate+365 & issuedate <= indexdate+730 ~ "yr2",
+                                   issuedate > indexdate+730 & issuedate <= indexdate+1095 ~ "yr3",
+                                   issuedate > indexdate+1095 & issuedate <= indexdate+1460 ~ "yr4",
+                                   issuedate > indexdate+1460 & issuedate <= indexdate+1825 ~ "yr5")) |>
+     fsubset(!is.na(time_point)) |>
+     group_by(patid,setid) |>
+     fmutate(polypharmacy_n = n_distinct(BNFChapter)) |>
+     funique(cols=c("patid","setid","time_point")) |>
+     fselect(patid,setid,time_point,polypharmacy_n)}) 
+
+# 
+ polypharmacy_counts_list |>
+  reduce(rowbind) |>
+   # sum polypharmacy_n
+   group_by(patid,setid,time_point) |>
+   fmutate(polypharmacy_n = sum(polypharmacy_n,na.rm = T)) |>
+   ungroup() |>
+  funique(cols=c("patid","setid","time_point")) |>
+  fmutate(polypharmacy = if_else(polypharmacy_n >= 5, 1, 0)) |>
+  fmutate(polypharmacy_bl = if_else(polypharmacy == 1 & time_point == "bl",1,0)) |>
+  fmutate(polypharmacy_yr1 = if_else(polypharmacy == 1 & time_point == "yr1",1,polypharmacy_bl)) |>
+  fmutate(polypharmacy_yr2 = if_else(polypharmacy == 1 & time_point == "yr2",1,polypharmacy_yr1)) |>
+  fmutate(polypharmacy_yr3 = if_else(polypharmacy == 1 & time_point == "yr3",1,polypharmacy_yr2)) |>
+  fmutate(polypharmacy_yr4 = if_else(polypharmacy == 1 & time_point == "yr4",1,polypharmacy_yr3)) |>
+  fmutate(polypharmacy_yr5 = if_else(polypharmacy == 1 & time_point == "yr5",1,polypharmacy_yr4)) |>
+  funique(cols=c("patid","setid")) |>
+  # individuals with no drug issue dates between study period or not match polyhpharmacy definition, polypharmacy == 0   
+  fmutate(polypharmacy_not_missing = 1) |>
+  join(fselect(collect(cohort_matched_2),patid,setid,indexdate,enddate),
+       on=c("patid","setid"),
+       how="full") |>
+  fmutate(polypharmacy_bl = if_else(is.na(polypharmacy_not_missing),0,polypharmacy_bl),
+          polypharmacy_yr1 = if_else(is.na(polypharmacy_not_missing),0,polypharmacy_yr1),
+          polypharmacy_yr2 = if_else(is.na(polypharmacy_not_missing),0,polypharmacy_yr2),
+          polypharmacy_yr3 = if_else(is.na(polypharmacy_not_missing),0,polypharmacy_yr3),
+          polypharmacy_yr4 = if_else(is.na(polypharmacy_not_missing),0,polypharmacy_yr4),
+          polypharmacy_yr5 = if_else(is.na(polypharmacy_not_missing),0,polypharmacy_yr5)) |>
+  # censored individuals should have missing deficit
+  fmutate(person_time_days = as.numeric(enddate - indexdate)) |>
+  fmutate(polypharmacy_yr1 = if_else(person_time_days > 0,polypharmacy_yr1,NA_integer_),
+          polypharmacy_yr2 = if_else(person_time_days > 365,polypharmacy_yr2,NA_integer_),
+          polypharmacy_yr3 = if_else(person_time_days > 365*2,polypharmacy_yr3,NA_integer_),
+          polypharmacy_yr4 = if_else(person_time_days > 365*3,polypharmacy_yr4,NA_integer_),
+          polypharmacy_yr5 = if_else(person_time_days > 365*4,polypharmacy_yr5,NA_integer_)) |>
+  fselect(patid,setid,polypharmacy_bl,polypharmacy_yr1,polypharmacy_yr2,
+          polypharmacy_yr3,polypharmacy_yr4,polypharmacy_yr5) 
+```
+
+### Combine 35 deficits with polypharmacy deficit
+```{r all_eFI_deficits}
+
+# all_eFI_deficits
+  eFI_35_deficits_data |>
+  join(polypharmacy_data,
+            on=c("patid","setid"),
+       how="left")
+```
+
+### Create eFI 
+
+Approach:
+
+1. Sum deficits ==1 and divide by 36
+
+```{r eFI_tidy}
+
+# create eFI variable
+  eFI_deficits_data|>
+  mutate(eFI_bl = rowSums(pick(matches(glue("^{deficits_names}_bl$"))))/36) |> 
+  mutate(eFI_yr1 = rowSums(pick(matches(glue("^{deficits_names}_yr1$"))))/36) |>
+  mutate(eFI_yr2 = rowSums(pick(matches(glue("^{deficits_names}_yr2$"))))/36) |>
+  mutate(eFI_yr3 = rowSums(pick(matches(glue("^{deficits_names}_yr3$"))))/36) |>
+  mutate(eFI_yr4 = rowSums(pick(matches(glue("^{deficits_names}_yr4$"))))/36) |>
+  mutate(eFI_yr5 = rowSums(pick(matches(glue("^{deficits_names}_yr5$"))))/36) |>
+  # create eFI categories
+  mutate(across(matches("^eFI_(bl|yr[1-5])$"),
+                ~cut(.x,
+                    breaks = c(0,0.12,0.24,0.36,Inf),
+                    include.lowest = T,
+                    labels = c("Fit: 0-0.12",
+                               "Mild: >0.12-0.24",
+                               "Moderate: >0.24-0.36",
+                               "Severe: >0.36")),
+                .names="{.col}_cat")) |>
+  fselect(patid,setid,eFI_bl,eFI_bl_cat,
+         eFI_yr1,eFI_yr1_cat,
+         eFI_yr2,eFI_yr2_cat,
+         eFI_yr3,eFI_yr3_cat,
+         eFI_yr4,eFI_yr4_cat,
+         eFI_yr5,eFI_yr5_cat,
+         atrial_fibrillation_bl,cerebrovascular_disease_bl,
+         heart_failure_bl,heart_valve_disease_bl,
+         rheumatoid_diseases_bl,
+         chronic_kidney_disease_bl,hypertension_bl,
+         ischaemic_heart_disease_bl,urinary_system_disease_bl,
+         osteoporosis_bl,parkinsonism_tremors_bl) 
+```
+
+## Frailty data 2: Create eFI deficits at baseline and overtime, thus as when new deficits are recorded at any time; for multi-state Cox regression
+
+Approach:
+1. Start with observation file
+2. Join observation file with codelist on medcodeid,
+3. If code matches, deficit = 1, otherwise deficit = 0
+4. If patid censored, deficit = NA otherwise bullet 3
+5. First define eFI at index date and update at each time a new (i.e, different from baseline) deficit is recorded, 
+6. Will use the deficit at indexdate from that from the annual deficits;
+so here is to just identify the new deficits and their dates
+6. 36 deficits in total, 35 are are commordities/health etc defined with codelist and 
+poypharmacy defined by counting number of prescribed medicines in BNF chapters 1-15 
+
+### Polypharmacy eFI deficit mstate
+
+1. Create polypharmacy deficit from drug files
+2. Define polypharmacy as ≥5 prescribed medications, using chapters 1–15 of the British National Formulary
+define polypharmacy within one year intervals; CPRD study:https://www.cprd.com/approved-studies/redefining-polypharmacy-population-based-longitudinal-study-using-electronic
+
+Approach:
+  
+1. Start with drugsssue files
+2. Filter product codes in aurum product dictionary
+3. All needed is the first time polypharmacy was recorded
+4. This will be the date the fifth drug was issued
+
+```{r eFI_deficit_polypharmacy_mstate}
+
+# Iterate the ff code on the drug issue files
+new_polypharmacy_data <- map(drugissues,.progress = T,function(x) {
+   collect(x)|>
+    fselect(patid,issuedate,prodcodeid) |>
+    fmutate(issuedate=as.Date(issuedate,"%d/%m/%Y")) |>
+    join(collect(aurum_product_dictionary),on=c("prodcodeid"),how="inner") |> 
+    fsubset(!is.na(BNFChapter)) |>
+    join(select(collect(cohort_matched_2),patid,setid,indexdate,enddate),
+         on=c("patid"),
+         how="left",
+         multiple = TRUE) |>
+    fsubset(issuedate > as.Date(-Inf) & issuedate <= enddate) |>
+    fselect(patid,setid,indexdate,issuedate,BNFChapter) |>
+    rename(obsdate=issuedate) |> 
+    distinct(patid,setid,BNFChapter,.keep_all = T)}) |> 
+  reduce(rowbind,fill=T) |> 
+  distinct(patid,setid,BNFChapter,.keep_all = T) |> 
+  group_by(patid,setid) |>
+  filter(n()>=5) |> 
+  arrange(obsdate,.by_group = T) |>
+  slice(5) |> 
+  fselect(patid,setid,obsdate,indexdate) |>
+  ungroup() |>
+  arrange(patid,setid,obsdate) |>
+  filter(obsdate > indexdate) |>
+  fselect(patid,setid,obsdate) |>
+  to_duckdb(con=my_con_integer64)
+```
+
+### 36 eFI deficits for multistate analyses
+
+```{r 36_eFI_deficits_mstate}
+
+# file paths to codelist
+# use list.files() function to get the list of file paths
+eFI_deficits_codelists_file_paths
+
+# a vector of the names of deficits
+deficits_names <- map_chr(eFI_deficits_codelists_file_paths, ~str_extract(.x,pattern = "(.*/)(.*)( .* codelist.csv$)",group = 2))
+
+# a named list of the codelists
+deficits_code_list <- setNames(map(eFI_deficits_codelists_file_paths, ~unique(pull(collect(open_csv_dataset(.x)),medcodeid))),
+                               deficits_names)
+
+
+# all codelits combined: vector
+deficits_code_df <- map(deficits_code_list,~as.data.frame(.x)) |> reduce(rowbind) |>
+  rename_with(~"medcodeid")
+
+# define deficit based on codelist
+# iterate the ff code on the observation files and combine result into a data set of the 35 deficits
+
+map(observations,.progress = TRUE,function(x) {
+  
+    collect(x) |> 
+    fselect(patid,obsdate,medcodeid) |>
+    funique(cols=c("patid","obsdate","medcodeid")) |>
+    fmutate(obsdate = as.Date(obsdate,format="%d/%m/%Y")) |>
+    fsubset(medcodeid %in% deficits_code_df$medcodeid) |>
+    fmutate(deficit_name=case_when(medcodeid %in% deficits_code_list[[1]] ~ deficits_names[[1]],
+                                   medcodeid %in% deficits_code_list[[2]] ~ deficits_names[[2]],
+                                   medcodeid %in% deficits_code_list[[3]] ~ deficits_names[[3]],
+                                   medcodeid %in% deficits_code_list[[4]] ~ deficits_names[[4]],
+                                   medcodeid %in% deficits_code_list[[5]] ~ deficits_names[[5]],
+                                   medcodeid %in% deficits_code_list[[6]] ~ deficits_names[[6]],
+                                   medcodeid %in% deficits_code_list[[7]] ~ deficits_names[[7]],
+                                   medcodeid %in% deficits_code_list[[8]] ~ deficits_names[[8]],
+                                   medcodeid %in% deficits_code_list[[9]] ~ deficits_names[[9]],
+                                   medcodeid %in% deficits_code_list[[10]] ~ deficits_names[[10]],
+                                   medcodeid %in% deficits_code_list[[11]] ~ deficits_names[[11]],
+                                   medcodeid %in% deficits_code_list[[12]] ~ deficits_names[[12]],
+                                   medcodeid %in% deficits_code_list[[13]] ~ deficits_names[[13]],
+                                   medcodeid %in% deficits_code_list[[14]] ~ deficits_names[[14]],
+                                   medcodeid %in% deficits_code_list[[15]] ~ deficits_names[[15]],
+                                   medcodeid %in% deficits_code_list[[16]] ~ deficits_names[[16]],
+                                   medcodeid %in% deficits_code_list[[17]] ~ deficits_names[[17]],
+                                   medcodeid %in% deficits_code_list[[18]] ~ deficits_names[[18]],
+                                   medcodeid %in% deficits_code_list[[19]] ~ deficits_names[[19]],
+                                   medcodeid %in% deficits_code_list[[20]] ~ deficits_names[[20]],
+                                   medcodeid %in% deficits_code_list[[21]] ~ deficits_names[[21]],
+                                   medcodeid %in% deficits_code_list[[22]] ~ deficits_names[[22]],
+                                   medcodeid %in% deficits_code_list[[23]] ~ deficits_names[[23]],
+                                   medcodeid %in% deficits_code_list[[24]] ~ deficits_names[[24]],
+                                   medcodeid %in% deficits_code_list[[25]] ~ deficits_names[[25]],
+                                   medcodeid %in% deficits_code_list[[26]] ~ deficits_names[[26]],
+                                   medcodeid %in% deficits_code_list[[27]] ~ deficits_names[[27]],
+                                   medcodeid %in% deficits_code_list[[28]] ~ deficits_names[[28]],
+                                   medcodeid %in% deficits_code_list[[29]] ~ deficits_names[[29]],
+                                   medcodeid %in% deficits_code_list[[30]] ~ deficits_names[[30]],
+                                   medcodeid %in% deficits_code_list[[31]] ~ deficits_names[[31]],
+                                   medcodeid %in% deficits_code_list[[32]] ~ deficits_names[[32]],
+                                   medcodeid %in% deficits_code_list[[33]] ~ deficits_names[[33]],
+                                   medcodeid %in% deficits_code_list[[34]] ~ deficits_names[[34]],
+                                   medcodeid %in% deficits_code_list[[35]] ~ deficits_names[[35]])) |>
+    fselect(patid,obsdate,deficit_name) |>
+    join(fselect(collect(cohort_matched_2),patid,setid,indexdate,enddate),
+         on = "patid",
+         how ="left",
+         multiple = TRUE) |> 
+    fsubset(obsdate > as.Date(-Inf) & obsdate <= enddate) |> 
+    arrange(patid,setid,obsdate) |>
+    funique(cols=c("patid","setid","deficit_name")) |> 
+    filter(obsdate > indexdate) |>
+    fselect(patid,setid,obsdate) |>
+    rbind(collect(new_polypharmacy_data)) |>
+    arrange(patid,setid,obsdate) |>
+    group_by(patid,setid,obsdate) |>
+    mutate(n_new_deficits_onday=n()) |> 
+    ungroup() |>
+    distinct(patid,setid,obsdate,.keep_all = T) }) |> 
+  reduce(rowbind,fill=T) |> 
+  distinct(patid,setid,obsdate,.keep_all = T) |> 
+  arrange(patid,setid,obsdate) 
+```
+
+## Now create frailty states over time
+
+1. Recalculate eFI anytime a new deficit is recorded; updating the previous eFI (noting the number of new deficits occurring exactly in same obsdate);
+Thus, group by c(patid,setid,obsdate) and then recalculate eFI by group after indexdate
+2. Based on that create a new status only when new eFI category is different from the previous
+
+```{r eFI_multi_states}
+
+# extract baseline eFI score
+eFI_score_bl <- eFI_data |>
+   select(patid,setid,eFI_bl) |>
+   left_join(transmute(collect(cohort_matched_2),patid,setid,eFI_bl_date =indexdate))
+
+# Create eFI mstate: note: any new one deficit increases eFI_bl by 1/36 = 0.02777778
+eFI_mstate_data <- new_eFI_36_deficits_data |>
+  group_by(patid,setid) |>
+  arrange(patid,setid,obsdate,.by_group = T) |>
+  ungroup() |>
+  left_join(eFI_score_bl) |>
+  group_by(patid,setid) |>
+  arrange(obsdate,.by_group = T) |>
+  mutate(eFI_mstate = eFI_bl+(cumsum(n_new_deficits_onday)*0.02777778)) |>
+  # create categories
+  ungroup() |>
+  select(patid,setid,obsdate,eFI_mstate) |>
+  bind_rows(transmute(eFI_score_bl,patid,setid,obsdate=eFI_bl_date,eFI_mstate =eFI_bl)) |> 
+  mutate(eFI_mstate_cat =  cut(eFI_mstate,
+                    breaks = c(0,0.12,0.24,0.36,Inf),
+                    include.lowest = T,
+                    labels = c("Fit: 0-0.12",
+                               "Mild: >0.12-0.24",
+                               "Moderate: >0.24-0.36",
+                               "Severe: >0.36"))) |>
+  fselect(patid,setid,eFI_mstate_cat,obsdate) |>
+  #keep the first of each eFI cat
+  arrange(patid,setid,obsdate) |>
+  distinct(patid,setid,eFI_mstate_cat,.keep_all = T) |>
+  # for each observation, when did each of the unique eFI_cat occur and date
+  mutate(eFI_fit = case_when(eFI_mstate_cat == "Fit: 0-0.12" ~ 1),
+         eFI_mild = case_when(eFI_mstate_cat == "Mild: >0.12-0.24" ~ 1),
+         eFI_moderate = case_when(eFI_mstate_cat == "Moderate: >0.24-0.36" ~ 1),
+         eFI_severe = case_when(eFI_mstate_cat == "Severe: >0.36" ~ 1)) |>
+  mutate(eFI_fit_date = case_when(eFI_mstate_cat == "Fit: 0-0.12" ~ obsdate),
+         eFI_mild_date = case_when(eFI_mstate_cat == "Mild: >0.12-0.24" ~ obsdate),
+         eFI_moderate_date = case_when(eFI_mstate_cat == "Moderate: >0.24-0.36" ~ obsdate),
+         eFI_severe_date = case_when(eFI_mstate_cat == "Severe: >0.36" ~ obsdate)) |>
+  group_by(patid,setid) |>
+  fill(matches("eFI_(fit|mild|moderate|severe)(_date)?"),.direction="downup") |>
+  ungroup() |>
+  select(patid,setid,matches("eFI_(fit|mild|moderate|severe)(_date)?")) |>
+  distinct(patid,setid,.keep_all = T) |>
+  left_join(collect(transmute(cohort_matched_2,patid,setid,indexdate,enddate,eFI_death_date=cprd_ddate))) |>
+  mutate(eFI_death = case_when(eFI_death_date <= enddate ~ 1,.default = 0)) |>
+  mutate(eFI_death_date = case_when(eFI_death_date <= enddate ~ eFI_death_date)) |>
+  mutate(eFI_fit_days = NA_real_) |> 
+  mutate(eFI_mild_days = as.numeric(pmin(eFI_mild_date,enddate,na.rm = T)-indexdate)) |> 
+  mutate(eFI_moderate_days = as.numeric(pmin(eFI_moderate_date,enddate,na.rm = T)-indexdate)) |>
+  mutate(eFI_severe_days =  as.numeric(pmin(eFI_severe_date,enddate,na.rm = T)-indexdate)) |>
+  mutate(eFI_death_days = as.numeric(pmin(eFI_death_date,enddate,na.rm = T)-indexdate)) |>
+  # IF DEATH AND eFI ON SAME DATE, DEATH SHOULD TAKE PRECEDENCE
+  mutate(across(matches("^eFI_(fit|mild|moderate|severe)$"),
+         ~if_else(get(glue("{cur_column()}_date"))==enddate,0,.x))) |>
+  mutate(across(matches("^eFI_(fit|mild|moderate|severe)_date$"),
+         ~if_else(.x==enddate,NA_Date_,.x))) |>
+  # Convert time to years
+  mutate(across(matches("_days$"),~.x/365.25,.names="{.col}_years")) |>
+  rename_with(~str_replace(.x,"days_years","years")) |>
+  relocate(patid,setid,indexdate,enddate) |>
+  mutate(across(matches("^eFI_(fit|mild|moderate|severe)$"),
+                ~if_else(is.na(.x),0,.x))) |>
+  relocate(eFI_death,.after = eFI_severe) |>
+  relocate(eFI_death_date,.after = eFI_severe_date) |>
+  to_duckdb(con = my_con_integer64)
+
+```
+
+
+# Study flow chart
+```{r flow_chart}
+
+# Study flow chart
+
+# All individuals in denominator file aged > 65 years before study ends in 2019-12-31
+
+all_aged_65 <- denominator |> # denominator dataset
+  select(patid, yob) |>
+  collect() |>
+  mutate(birthday_65th=as.Date(paste0(yob+65, "/06/01"),format = "%Y/%m/%d")) |> 
+  filter(birthday_65th<=as.Date("2019-12-31","%Y-%m-%d")) |>
+  nrow()
+
+# Eligible for inclusion
+
+nrow(collect(cohort_eligible))
+
+# Not eligible for inclusion
+
+all_aged_65 - nrow(collect(cohort_eligible))
+
+# Matched
+nrow(collect(cohort_matched_2))
+tabyl(collect(cohort_matched_2),exposed)
+
+# Not matched
+nrow(collect(cohort_eligible)) - nrow(collect(cohort_matched_2))
+
+# XXX had missing frailty index (eFI) from 1-5 years follow-up (were censored at cohort entry)
+eFI_data |>
+  filter(!is.na(eFI_bl),if_all(matches("^eFI_yr[1-5]$"),~is.na(.x))) |> 
+  dim()
+
+# XXX had missing frailty index (eFI) from 1-5 years follow-up (were censored at cohort entry)
+# this does not apply as if not censored, eFI is either yes or no
+
+# Final cohort
+collect(cohort_matched_2)|>
+  left_join(eFI_data.rds, join_by(patid,setid)) |>
+  filter(if_any(matches("^eFI_yr[1-5]$"),~!is.na(.x))) |> 
+  count(exposed)
+
+# Infection site and type
+collect(cohort_matched_2)|>
+  left_join(eFI_data.rds, join_by(patid,setid)) |>
+  filter(if_any(matches("^eFI_yr[1-5]$"),~!is.na(.x)),exposed==1) |> 
+  left_join(infection_data , join_by(patid,setid)) |>
+  count(inf_type_of_match_grp )
+#
+collect(cohort_matched_2)|>
+  left_join(eFI_data , join_by(patid,setid)) |>
+  filter(if_any(matches("^eFI_yr[1-5]$"),~!is.na(.x)),exposed==1) |> 
+  left_join(infection_data, join_by(patid,setid)) |>
+  count(inf_site_of_match_grp)
+```
+

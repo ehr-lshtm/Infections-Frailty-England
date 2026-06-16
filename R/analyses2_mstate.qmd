@@ -1,0 +1,1625 @@
+---
+title: "A multistate model of frailty progression after severe infections in adults ≥65 years in England: a matched-cohort study"
+author: "Kwabena Asare"
+date: "`r lubridate::today()`"
+format: html
+execute: 
+  include: true
+  echo: false
+  eval: false
+editor_options: 
+  chunk_output_type: console
+---
+
+## Main Analyses
+
+**Individuals making at least one follow-up**: this is the main analysis sample: dataset already filtered accordingly
+
+### Table 1: Descriptive results at indexdate
+
+**Table 1.** Descriptive summaries of **baseline** characteristics by severe infection (exposure) status.
+
+```{r table_one_main}
+
+# baseline characteristics by exposure status
+
+table_one_main <- collect(inf_frailty_cprd) |>
+  transmute(exposed = if_else(exposed == 0, "No","Yes"),
+            age_bl,age_bl_cat4,gender,ethnicity,
+            e2019_imd,harmful_alcohol_use,
+            smoking,care_home_residency,
+            gp_infection_5yr_lookback,gp_infection_7dy_lookback,
+            antibio_7dy_lookbck,dementia,diabetes,
+            atrial_fibrillation_bl,
+            chronic_kidney_disease_bl,hypertension_bl,
+            urinary_system_disease_bl,
+            osteoporosis_bl,parkinsonism_tremors_bl,
+            ischaemic_heart_disease_bl,heart_failure_bl,
+            cerebrovascular_disease_bl,rheumatoid_diseases_bl,
+            eFI_bl,eFI_bl_cat,one_consult_1y_lookbck) |> collect() |>
+  rename_with(.fn = ~str_replace(.x,"_bl","")) |>
+  tbl_summary(by="exposed",
+              missing_text = "Missing",
+              type=list(c(age,eFI) ~ "continuous2"),
+              statistic = list(all_continuous2() ~ c("{mean} ({sd})","{median} ({p25}, {p75})")),
+              digits = list(all_continuous() ~ 0,c(eFI) ~ 2)) |>
+  bold_labels() |>
+  modify_footnote(everything() ~ NA) |>
+  modify_caption(glue("**Table 1.** Characteristics of participants at index date (England)")) |>
+  modify_spanning_header(all_stat_cols() ~ "**Severe infection after age 65 years**")
+
+table_one_main
+```
+
+## Multi-state survival analysis: Cox regression
+## Transition specific Cox regression models
+
+For each outcome build models with the following sequence of confounder adjustment sets:
+
+ - **Minimally adjusted** models: adjust for matching variables (age, gender), ethnicity: 
+   **No need to adjust for baseline eFI category since this is same for each transition risk set**
+   **However can adjust for the eFI score though**
+ - **Deprivation adjusted** models: further adjust minimal model for:
+    - individual and practice level IMD (quntiles)
+ - **Lifestyle adjusted** models: further adjust deprivation model for:
+    - smoking
+    - harmful alcohol use
+ - **Infection history** models: further adjust lifestyle model for:
+  - 5 yr look back infections; gp recorded
+
+### Step 1: Set up transition matrix
+ - The transition matrix specifies which direct transitions are possible
+(those with NA are impossible) and assigns numbers to the transitions for future reference.
+ - **Note:** Only forward transitions are possible since eFI 1.0 only ever increases
+
+```{r transMat}
+# Done manually
+
+tmat_inf_frail <- matrix(NA,5,5)
+
+dimnames(tmat_inf_frail) <- list(from = c("fit", "mild_frail", "mod_frail","severe_frail","death"),
+                       to = c("fit", "mild_frail", "mod_frail","severe_frail","death"))
+
+tmat_inf_frail[1,2:5] <- 1:4
+tmat_inf_frail[2,3:5] <- 5:7
+tmat_inf_frail[3,4:5] <- 8:9
+tmat_inf_frail[4,5] <- 10
+
+# With transMat() from mstate package
+transMat(x=c(list(c(2:5),c(3:5),c(4:5),c(5),c())),
+         names = c("fit", "mild_frail", "mod_frail","severe_frail","death"))
+
+```
+
+### Step 2: Prepare data for mstate
+
+```{r reshape_mstate}
+
+# covariates: condounder adjustment set categories
+matching <- c("exposed","eFI_bl") 
+deprivation <- c("e2019_imd")
+lifestyle <- c("harmful_alcohol_use","smoking")
+infection_history <- c("gp_infection_5yr_lookback")
+ethnicity <- c("ethnicity") 
+covariates <- c(matching,deprivation,lifestyle,infection_history)
+other_covariates <- c("patid","setid","indexdate","gp_infection_7dy_lookback","antibio_7dy_lookbck","diabetes","dementia",
+                        "care_home_residency","inf_site_of_match_grp","inf_type_of_match_grp")
+  
+# mstate data
+# THOSE THAT DO NOT START FROM FIT BUT A HIGHER STATE, THEY CANNOT MOVE TO THEIR STARTING STATES BUT ONLY MOVE FROM THEM
+# SO AFTER PREPING THE DATA REMOVE ALL THEIR TRANSITIONS BEFORE THEIR STARTING STATES
+# ALL SUCH TRANSITIONS WILL HAVE STOP TIME == 0
+inf_frailty_cprd_mstate <- msprep(time = c(NA,"eFI_mild_years","eFI_moderate_years","eFI_severe_years","eFI_death_years"),
+                status = c(NA,"eFI_mild","eFI_moderate","eFI_severe","eFI_death"), 
+                data = left_join(select(collect(eFI_mstate_data),-c(enddate,indexdate)),
+                                 select(collect(inf_frailty_cprd),any_of(c(covariates,ethnicity,other_covariates))),
+                                 join_by(patid,setid)) |> mutate(setid=as.numeric(factor(setid))), 
+                trans = tmat_inf_frail,
+                keep = c(covariates,other_covariates,ethnicity)) |>
+  # remove transitions into non eFI_fit starting states
+   filter(Tstop!=0) 
+
+# distribution of events
+ events_all <- events(inf_frailty_cprd_mstate) 
+
+# in the exposed (severe infection)
+ events_exposed <- events(filter(inf_frailty_cprd_mstate,exposed==1))
+# in the unexposed
+ events_un_exposed <- events(filter(inf_frailty_cprd_mstate,exposed==0))
+```
+
+
+### Step 3: Add transition-specific covariates to the data
+```{r transition_specific_covariates}
+
+# data with all expanded covariates
+inf_frailty_cprd_mstate_expcovs <- expand.covs(inf_frailty_cprd_mstate,
+                                               covs = c(covariates,ethnicity),append = T,longnames = F) |>
+  to_duckdb(con = my_con_integer64)
+
+#expanded covariate sets: 
+expanded_covariates  <-  grep("[.]\\d+$",names(select(collect(inf_frailty_cprd_mstate_expcovs),matches(glue("{covariates}.*")))),value = T)
+# matching factors  
+expanded_covariates_matching  <- grep("[.]\\d+$",names(select(collect(inf_frailty_cprd_mstate_expcovs),matches(glue("{matching}.*")))),value = T)
+
+expanded_covariates_deprivation  <-   grep("[.]\\d+$",names(select(collect(inf_frailty_cprd_mstate_expcovs),matches(glue("{c(matching,deprivation)}.*")))),value = T)
+
+expanded_covariates_lifestyle  <-  grep("[.]\\d+$",names(select(collect(inf_frailty_cprd_mstate_expcovs),matches(glue("{c(matching,deprivation,lifestyle)}.*")))),value = T)
+
+expanded_covariates_infection_history <-  grep("[.]\\d+$",names(select(collect(inf_frailty_cprd_mstate_expcovs),matches(glue("{c(matching,deprivation,lifestyle,infection_history)}.*")))),value = T)
+
+expanded_covariates_ethnicity <-  grep("[.]\\d+$",names(select(collect(inf_frailty_cprd_mstate_expcovs),matches(c(glue("{c(matching,deprivation,lifestyle,infection_history)}.*"),"ethnicity")))),value = T)
+
+```
+
+### Step 3 Estimation
+#### Transition stratified and setid stratified Cox regression to obtain all transition-specific HR and transition probabilities from one model
+
+```{r all_mstate_cox_matching}
+# NOTE: to include only covariate sets not missing
+# Since these are levels in the data ("Missing")
+
+all_mstate_cox_matching <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_matching,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = collect(inf_frailty_cprd_mstate_expcovs))
+```
+
+```{r all_mstate_cox_deprivation}
+all_mstate_cox_deprivation <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_deprivation,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),
+                                               if_all(all_of(c(matching,deprivation)),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r all_mstate_cox_lifestyle}
+all_mstate_cox_lifestyle <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_lifestyle,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),
+                                               if_all(all_of(c(matching,deprivation,lifestyle)),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r all_mstate_cox_infection_history}
+all_mstate_cox_infection_history <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+```
+
+
+#### Figure 2: Forest plots of fully adjusted transition specific HR (95% CI): Severe infections vs no severe infection
+
+```{r forest_plot}
+# data.frame one: extract model elements into a dataframe; HRs and 95% CIs
+forestplot_mstate_HRs <- function(model, # a cox model with all transiotioin HRs
+                            events_exposed, # events in the exposed; obtained with mstate::events()
+                            events_un_exposed,
+                            by_sub_group=T,
+                            clip=5,legend_x_pos=0.01,legend_y_pos=0.01,legend_dist=0.195,plot_mar=5,
+                            plot_save_name,height=15,width=28,...) {
+
+  plot_df <- if(is.data.frame(model)) model else 
+    tidy(model,exponentiate = T,conf.int = T)[1:10,c("term","estimate", "conf.low","conf.high")] |>
+      # Add n. events/at risk number of events and N
+    mutate(events_exp = c(events_exposed$Frequencies[1,2],events_exposed$Frequencies[1,3],
+                          events_exposed$Frequencies[1,4],events_exposed$Frequencies[1,5],
+                          events_exposed$Frequencies[2,3],events_exposed$Frequencies[2,4],
+                          events_exposed$Frequencies[2,5],events_exposed$Frequencies[3,4],
+                          events_exposed$Frequencies[3,5],events_exposed$Frequencies[4,5]),
+           sample_size_exp = c(rep(events_exposed$Frequencies[1,7],4),
+                               rep(events_exposed$Frequencies[2,7],3),
+                               rep(events_exposed$Frequencies[3,7],2),
+                               events_exposed$Frequencies[4,7])) |>
+    mutate(events_un_exp = c(events_un_exposed$Frequencies[1,2],events_un_exposed$Frequencies[1,3],
+                             events_un_exposed$Frequencies[1,4],events_un_exposed$Frequencies[1,5],
+                             events_un_exposed$Frequencies[2,3],events_un_exposed$Frequencies[2,4],
+                             events_un_exposed$Frequencies[2,5],events_un_exposed$Frequencies[3,4],
+                             events_un_exposed$Frequencies[3,5],events_un_exposed$Frequencies[4,5]),
+           sample_size_un_exp = c(rep(events_un_exposed$Frequencies[1,7],4),
+                                  rep(events_un_exposed$Frequencies[2,7],3),
+                                  rep(events_un_exposed$Frequencies[3,7],2),
+                                  events_un_exposed$Frequencies[4,7])) |>
+    mutate(n_N_exp = paste0(events_exp,"/",sample_size_exp),
+           n_N_un_exp = paste0(events_un_exp,"/",sample_size_un_exp)) |>
+    # Mast events from 1:50
+    mutate(n_N_exp = if_else(events_exp %in% 1:50,paste0("<50","/",sample_size_exp),n_N_exp),
+           n_N_un_exp = if_else(events_un_exp %in% 1:50,paste0("<50","/",sample_size_un_exp),n_N_un_exp)) |>
+    mutate(term_description = c("Fit to Mild Frailty","Fit to Moderate Frailty",
+                                "Fit to Severe Frailty","Fit to Death",
+                                "Mild to Moderate Frailty","Mild to Severe Frailty",
+                                "Mild Frailty to Death","Moderate to Severe Frailty",
+                                "Moderate Frailty to Death","Severe Frailty to Death"),.after = 1) |>
+    mutate(term_description = factor(term_description,
+                                     levels = c("Fit to Mild Frailty","Fit to Moderate Frailty",
+                                                "Fit to Severe Frailty","Fit to Death",
+                                                "Mild to Moderate Frailty","Mild to Severe Frailty",
+                                                "Mild Frailty to Death","Moderate to Severe Frailty",
+                                                "Moderate Frailty to Death","Severe Frailty to Death"))) |>
+    mutate(across(c(conf.low,conf.high),~if_else(.x < 0.0001 | .x > 100,0,.x))) |>
+    mutate(est_label = if_else(is.na(estimate),NA_character_,
+                               paste0(formatC(estimate,format = "f",digits = 2),
+                                                                    " (",formatC(conf.low,format = "f",digits = 2),", ",
+                                                                    formatC(conf.high,format = "f",digits = 2),")")),
+           across(c(estimate,conf.low,conf.high),~round(.x,2)) ) |>
+    #filter(term_description != "Fit to Severe Frailty") |>
+    mutate(across(c(estimate,conf.low,conf.high),~if_else(.x < 0.0001 | .x > 100,NA,.x))) |>
+    mutate(est_label_middot=paste0(str_replace_all(est_label,"[.]","\U00B7")),
+           estimate_middot = str_replace(estimate,"[.]","\U00B7")) |>
+    mutate(across(c(conf.low,conf.high,est_label,estimate),~ if_else(events_exp==0|events_un_exp==0,NA,.x))) |>
+    mutate(sub_group=0)
+  
+  # graphical parameters
+  plot_cols <- c("darkblue","darkred","darkgreen","orange","purple","yellow4")
+  
+  line_cols <-  case_when(as.numeric(plot_df$sub_group)==1~plot_cols[[1]],
+                          as.numeric(plot_df$sub_group)==2 ~plot_cols[[2]],
+                          as.numeric(plot_df$sub_group)==3 ~plot_cols[[3]],
+                          as.numeric(plot_df$sub_group)==4 ~plot_cols[[4]],
+                          as.numeric(plot_df$sub_group)==5 ~plot_cols[[5]],
+                          as.numeric(plot_df$sub_group)==6 ~plot_cols[[6]],.default = "black")
+
+    
+    #  forest plot
+             fp <- forestplot(plot_df,
+             labeltext=c(term_description,n_N_exp,n_N_un_exp,est_label_middot),
+             mean = estimate,
+             lower = conf.low,
+             upper = conf.high,
+             clip = c(-Inf,clip),
+             xticks =seq(0,clip,1),
+             xlab="HR (95% CI)",
+             boxsize=.20,
+             zero=1,
+             mar = unit(rep(plot_mar, times = 4), "mm")) |>  # bottom, left, top, right) 
+    fp_add_header(n_N_exp = "Severe infection\n(n. events/at risk)",
+                  n_N_un_exp = "No severe infection\n(n. events/at risk)",
+                  est_label_middot= "Adjusted HR (95% CI)") |>
+    fp_set_style(line = if(isTRUE(by_sub_group)) c("black",line_cols) else "black",
+                 box = if(isTRUE(by_sub_group)) c("black",line_cols) else "black",
+                 zero =gpar(col = "black", lty = "solid")) |>
+    fp_decorate_graph(graph.pos = 4) |>
+    fp_add_lines(h_2 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),...)
+
+ 
+  # save forest plots
+  saveRDS(fp,glue("{getwd()}/results/{plot_save_name}.rds"))
+  
+  png(glue("{getwd()}/results/{plot_save_name}.png"),height = height,width = width,units = "cm",res = 300) # 25cm = 250mm, min is 107mm, 300 dpi resolution
+  if(isFALSE(by_sub_group)) print(fp) else { 
+    print(fp)
+      legend_labels <- levels(plot_df$sub_group)
+      legend_cols   <- plot_cols[1:length(levels(plot_df$sub_group))]
+      
+      for (i in seq_along(legend_labels)) {
+        
+        grid.points(
+          y = unit(legend_y_pos, "npc"),
+          x = unit(legend_x_pos+i*legend_dist, "npc"),
+          pch = 15,
+          gp = gpar(col = legend_cols[i])
+        )
+        
+        grid.text(
+          legend_labels[i],
+          y = unit(legend_y_pos, "npc"),
+          x = unit(legend_x_pos+0.007+i*legend_dist, "npc"),
+          just = "left",
+          gp = gpar(fontsize = 12,fontface="bold")
+        )
+      }
+    }
+  
+  dev.off()
+  
+  tiff(glue("{getwd()}/results/{plot_save_name}.tiff"),height = height,width = width,units = "cm",res = 300) # 25cm = 250mm, min is 107mm, 300 dpi resolution
+  if(isFALSE(by_sub_group)) print(fp) else { 
+    print(fp)
+      legend_labels <- levels(plot_df$sub_group)
+      legend_cols   <- plot_cols[1:length(levels(plot_df$sub_group))]
+      
+      for (i in seq_along(legend_labels)) {
+        
+        grid.points(
+          y = unit(legend_y_pos, "npc"),
+          x = unit(legend_x_pos+0.007+i*legend_dist, "npc"),
+          pch = 15,
+          gp = gpar(col = legend_cols[i])
+        )
+        
+        grid.text(
+          legend_labels[i],
+          y = unit(legend_y_pos, "npc"),
+          x = unit(legend_x_pos+0.007+i*legend_dist, "npc"),
+          just = "left",
+          gp = gpar(fontsize = 12,fontface="bold")
+        )
+      }
+    }
+  
+  dev.off()
+  
+}
+
+```
+
+```{r forest_plot_full_model}
+  # forest plot: main
+forestplot_mstate_HRs(model = all_mstate_cox_infection_history.,
+                                            events_exposed = events(filter(inf_frailty_cprd_mstate,
+                                                                           exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                                            events_un_exposed = events(filter(inf_frailty_cprd_mstate,
+                                                                           exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                      by_sub_group = F,
+                                            plot_save_name = "Figure_3_mstate",
+                      h_6 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_9 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_11 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2))
+```
+
+### Figure_S2: Forest plots sequential adjustments
+## Create a function to extract and combine model data from sub-group analyses
+
+```{r extract_model_data}
+
+extract_model_data <- function(model,events_exposed,events_un_exposed,sub_group_level=NULL,sub_group_desc=NULL) { 
+  
+  model <- if(is.data.frame(model)) model else tidy(model,exponentiate = T,conf.int = T)[1:10,c("term","estimate", "conf.low","conf.high")] 
+  
+  
+  plot_df <- model|> 
+      # Add n. events/at risk number of events and N
+    mutate(events_exp = c(events_exposed$Frequencies[1,2],events_exposed$Frequencies[1,3],
+                        events_exposed$Frequencies[1,4],events_exposed$Frequencies[1,5],
+                        events_exposed$Frequencies[2,3],events_exposed$Frequencies[2,4],
+                        events_exposed$Frequencies[2,5],events_exposed$Frequencies[3,4],
+                        events_exposed$Frequencies[3,5],events_exposed$Frequencies[4,5]),
+         sample_size_exp = c(rep(events_exposed$Frequencies[1,7],4),
+                             rep(events_exposed$Frequencies[2,7],3),
+                             rep(events_exposed$Frequencies[3,7],2),
+                             events_exposed$Frequencies[4,7])) |>
+  mutate(events_un_exp = c(events_un_exposed$Frequencies[1,2],events_un_exposed$Frequencies[1,3],
+                           events_un_exposed$Frequencies[1,4],events_un_exposed$Frequencies[1,5],
+                           events_un_exposed$Frequencies[2,3],events_un_exposed$Frequencies[2,4],
+                           events_un_exposed$Frequencies[2,5],events_un_exposed$Frequencies[3,4],
+                           events_un_exposed$Frequencies[3,5],events_un_exposed$Frequencies[4,5]),
+         sample_size_un_exp = c(rep(events_un_exposed$Frequencies[1,7],4),
+                                rep(events_un_exposed$Frequencies[2,7],3),
+                                rep(events_un_exposed$Frequencies[3,7],2),
+                                events_un_exposed$Frequencies[4,7])) |>
+  mutate(n_N_exp = paste0(events_exp,"/",sample_size_exp),
+         n_N_un_exp = paste0(events_un_exp,"/",sample_size_un_exp)) |>
+  # Mast events from 1:50
+  mutate(n_N_exp = if_else(events_exp %in% 1:50,paste0("<50","/",sample_size_exp),n_N_exp),
+         n_N_un_exp = if_else(events_un_exp %in% 1:50,paste0("<50","/",sample_size_un_exp),n_N_un_exp)) |>
+  mutate(term_description = c("Fit to Mild Frailty","Fit to Moderate Frailty",
+                              "Fit to Severe Frailty","Fit to Death",
+                              "Mild to Moderate Frailty","Mild to Severe Frailty",
+                              "Mild Frailty to Death","Moderate to Severe Frailty",
+                              "Moderate Frailty to Death","Severe Frailty to Death"),.after = 1) |>
+  mutate(term_description = factor(term_description,
+                                   levels = c("Fit to Mild Frailty","Fit to Moderate Frailty",
+                                              "Fit to Severe Frailty","Fit to Death",
+                                              "Mild to Moderate Frailty","Mild to Severe Frailty",
+                                              "Mild Frailty to Death","Moderate to Severe Frailty",
+                                              "Moderate Frailty to Death","Severe Frailty to Death"))) |>
+  mutate(across(c(estimate,conf.low,conf.high),~if_else(.x < 0.0001 | .x > 100,NA,.x))) |>
+  mutate(est_label = if_else(is.na(estimate),NA_character_,
+                             paste0(formatC(estimate,format = "f",digits = 2),
+                                    " (",formatC(conf.low,format = "f",digits = 2),", ",
+                                    formatC(conf.high,format = "f",digits = 2),")")),
+         across(c(estimate,conf.low,conf.high),~round(.x,2)) ) |>
+  #filter(term_description != "Fit to Severe Frailty") |>
+  mutate(est_label_middot=paste0(str_replace_all(est_label,"[.]","\U00B7")),
+         estimate_middot = str_replace(estimate,"[.]","\U00B7")) |>
+  mutate(across(c(conf.low,conf.high,est_label,estimate),~ if_else(events_exp==0|events_un_exp==0,NA,.x))) |>
+    mutate(sub_group = factor(sub_group_level,labels=sub_group_desc))
+  }
+
+
+```
+
+
+```{r forest_plot_sequential_adjustment}
+
+plot_df_sequential_adjustment <- rbind( # matching
+  extract_model_data(model = all_mstate_cox_matching,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,exposed==1)),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,exposed==0)),sub_group_level = 1,sub_group_desc="Baseline frailty"),
+  # deprivation
+  extract_model_data(model = all_mstate_cox_deprivation,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,exposed==1,if_all(all_of(covariates),~(!is.na(.x) & .x != "Missing")))),
+                      events_un_exposed = events(filter(inf_frailty_cprd_mstate,exposed==0,if_all(all_of(covariates),~(!is.na(.x) & .x != "Missing")))),sub_group_level = 2,sub_group_desc="Deprivation"),
+  # lifestyle
+  extract_model_data(model = all_mstate_cox_lifestyle,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,exposed==1,if_all(all_of(c(covariates,deprivation,lifestyle)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,exposed==0,if_all(all_of(c(covariates,deprivation,lifestyle)),~(!is.na(.x) & .x != "Missing")))),sub_group_level = 3,sub_group_desc="Lifestyle"),
+  # infection_history
+  extract_model_data(model = all_mstate_cox_infection_history.,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,exposed==1,if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,exposed==0,if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),sub_group_level = 4,sub_group_desc="Infection histroy")) |>
+  arrange(term_description,sub_group) |>
+  mutate(term_description = if_else(duplicated(term_description),NA_character_,term_description)) 
+
+# Plot
+forestplot_mstate_HRs(model = plot_df_sequential_adjustment,
+                      height = 45,width = 32,
+                      plot_save_name = "Figure_S2_mstate",
+                      h_6 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_10 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_14 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_18 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_22 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_26 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_30 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_34 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_38 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2))
+```
+
+
+### Step 4: Prediction
+
+This is basically prediction of the cumulative incidence.
+Just to highlight that for CAUSE SPECIFIC HAZARDS which we have estimated for the multi-state modeling,
+effects on the cumulative incidence function may be different from what the regression coefficients (HR) suggest.
+AKA, no one-to-one relationship between the HR and the CI function.
+
+Thus these estimates of the transition probabilities of events are based on the results obtained from the Cox model on the transition hazards
+between the states.
+
+What is being estimated here is the (Prob of an event | event history and a set of covariates) at a particular time.
+Estimating this over time gives the curve of the probabilities. To specifically estimate these among exposed and unexposed adults:
+
+ 1. Probabilities of entering each state and 
+ 2. Mean state occupation times
+ 3. **To do up to 5 years based on mean follow-up time**
+ 4. Only for the fully adjusted models
+
+Given a multi-state model without recurrent events, these probabilities can be expressed in terms
+of the hazards for the transitions and can be estimated by appropriately combining the estimated
+baseline hazards and regression coefficients.
+
+#### Prediction data
+```{r prediction_data}
+
+# New data for one exposed and unexposed person
+# newdata data frame needs to have exactly one line for each transition per person
+# must be of msdata class with a trans attribute
+
+# un_exp
+new_data_un_exp <- data.frame(matrix(rep(0,60),ncol = 6)) |>
+  rename_with(~covariates) |>
+  mutate(trans=1:10,strata=1:10) |>
+  mutate(smoking = factor(smoking,levels = 0:3,
+                              labels = unique(collect(inf_frailty_cprd)$smoking)))
+
+attr(new_data_un_exp,"trans") <- tmat_inf_frail
+class(new_data_un_exp) <- c("msdata","data.frame")
+new_data_un_exp <- expand.covs(new_data_un_exp,covariates,longnames=F)
+
+# exp
+new_data_exp <- data.frame(matrix(rep(0,60),ncol = 6)) |>
+  rename_with(~covariates) |>
+  mutate(trans=1:10,strata=1:10,exposed=1)|>
+  mutate(smoking = factor(smoking,levels = 0:3,
+                              labels = unique(collect(inf_frailty_cprd)$smoking)))
+
+attr(new_data_exp,"trans") <- tmat_inf_frail
+class(new_data_exp) <- c("msdata","data.frame")
+new_data_exp <- expand.covs(new_data_exp,covariates,longnames=F)
+```
+
+#### Predicted Hazards
+```{r predict_hazards}
+
+# Obtain patient specific transition hazards: using the baseline hazards and coefficients from the cox model: to use the msfit() function
+
+# The result is an object of class msfit, which is a list with three items, Haz, varHaz, and trans
+
+# NOTE: for each patient all predictions are at the event times
+
+
+baseline_hz_predict_un_exp  <- msfit(all_mstate_cox_infection_history., newdata = new_data_un_exp, trans = tmat_inf_frail)
+
+summary(baseline_hz_predict_un_exp)
+baseline_hz_predict_un_exp[[1]]
+
+#
+baseline_hz_predict_exp  <- msfit(all_mstate_cox_infection_history., newdata = new_data_exp, trans = tmat_inf_frail)
+
+#
+summary(baseline_hz_predict_exp)
+baseline_hz_predict_exp[[1]]
+```
+
+#### Predicted probability of transition
+```{r predict_prob_trans}
+
+#' We are interested in estimating so called transition probabilities
+#' For instance, P13(0, t) indicates the probability of having been moderately frail (state 3)
+#' by time t, say yr5 given that the individual was fit in state (state 1) at time s = 0
+
+# use the resulting patient-specific transition hazards (and variances and covariances) as input
+# for probtrans() to obtain (patient-specific) transition probabilities
+# Note: one exposed and one unexposed person
+
+#' The result of probtrans is a probtrans object, which is a list, where item [[i]] contains
+#' predictions from state i. Each item of the list is a data frame with time containing all event
+#' time points, and pstate1, pstate2, etc the probabilities of being in state 1, 2, etc, and finally
+#' se1, se2 etc the standard errors of these estimated probabilities.
+
+# NOTE: To stress that the predictions are from a particular state and the probs represent the prob of 
+# being in a particular state starting from a particular previous state at that event time
+# for a prediction at a particular time, you can use the time var to filter
+# Also NOTE that the for each element in the list representing the transition,
+# the first col gives the prob of remaining in the state without transitioning to a higher state
+
+# So the plot actually plots the n = trans col; the col corresponding to the transition
+
+# starting from Fit
+probtrans_un_exp <- probtrans(baseline_hz_predict_un_exp,predt = 0)
+
+summary(probtrans_un_exp,from =1)
+head(probtrans_un_exp[[1]])
+slice(filter(probtrans_un_exp[[1]],time>=5),1)
+
+#
+probtrans_exp <- probtrans(baseline_hz_predict_exp,predt = 0)
+summary(probtrans_exp,from =1)
+head(probtrans_exp[[1]])
+slice(filter(probtrans_exp[[1]],time>=5),1)
+```
+
+```{r state_occupancy_prob_yr5}
+
+# State occupancy probabilities starting from each state at a time
+# Death is the absorbing state so can't start from death
+
+state_occu_prob_5 <- rbind(
+  slice(filter(probtrans_exp[[1]],time>=5),1),
+  slice(filter(probtrans_exp[[2]],time>=5),1),
+  slice(filter(probtrans_exp[[3]],time>=5),1),
+  slice(filter(probtrans_exp[[4]],time>=5),1),
+  slice(filter(probtrans_un_exp[[1]],time>=5),1),
+  slice(filter(probtrans_un_exp[[2]],time>=5),1),
+  slice(filter(probtrans_un_exp[[3]],time>=5),1),
+  slice(filter(probtrans_un_exp[[4]],time>=5),1)) |>
+  rename(Fit = pstate1,
+         Mild = pstate2,
+         Moderate = pstate3,
+         Severe = pstate4,
+         Death = pstate5,
+         Fit_se = se1,
+         Mild_se = se2,
+         Moderate_se = se3,
+         Severe_se = se4,
+         Death_se = se5) |>
+  mutate(across(Fit:Death_se,~round(.x,3)*100)) |>
+  mutate(exposure = c(1,1,1,1,0,0,0,0),
+         from = rep(c("Fit","Mild","Moderate","Severe"),2),.after=time) |>
+   # calculate 95% CI
+  mutate(across(matches("(Fit|Mild|Moderate|Severe|Death)$"),
+                ~paste0(.x," (",.x-round(1.96*get(glue("{cur_column()}_se")),1),", ",
+                                                      .x+round(1.96*get(glue("{cur_column()}_se")),1),")"),
+                .names = "{.col}_ci")) |>
+  select(time,exposure,from,matches("ci")) |>
+  mutate(across(matches("ci"),~if_else(.x=="0 (0-0)",NA_character_,.x)))
+
+#
+states <- c("Fit","Mild","Moderate","Severe","Death")
+
+state_occu_prob_5 |>
+  select(-c(time)) |>
+  relocate(from) |>
+  gt(rowname_col = "from",caption = "Probability of transition at 5 years")
+```
+
+#### Figure 3: Stacked predicted state occupancy probabilities over time and mean state occupancy times
+```{r stacked_plots_from_fit}
+
+# Plot transition probabilities from state 1; the from arg in the plot.msfit(); default from == 1
+# So this plot uses one transition to plot from 
+# the estimates are still prob of remaining in a state; starting from state 1 (fit)
+# can do other graphs starting from each state
+
+# Step 3: Stacked predicted probability of transitions plot
+# The default type of the plot method for probtrans objects is a "stacked" plot, for which the
+# difference between two adjacent lines represents the probability of being in a state
+
+# From fit
+plot_exp_from_fit <- plot(probtrans_exp,
+     ord=c(1:5),linewidth=2,
+     xlab = "Years since entering fit frailty state at index date",
+     ylab = "Probability",
+     cex=0.75,
+     xlim = c(0,6),
+     main="A. From fit status (severe infection)",
+     legend = c("Fit","Mild Frailty","Moderate Frailty","Severe Frailty","Death"),
+     legend.pos = "top",
+     cols = c("#4DAF4A","#377EB8","#984EA3","#8B8B00","#E41A1C"), # inspired by brewer.pal(5,"Set1"),
+     use.ggplot = T) 
+
+
+plot_un_exp_from_fit <- plot(probtrans_un_exp,
+     ord=c(1:5),linewidth=2,
+     xlab = "Years since entering fit frailty state at index date",
+     ylab = "Probability",
+     cex=0.75,
+     xlim = c(0,6),
+     main="B. From fit status (no severe infection)",
+     legend = c("Fit","Mild Frailty","Moderate Frailty","Severe Frailty","Death"),
+     legend.pos = "top",
+     cols = c("#4DAF4A","#377EB8","#984EA3","#8B8B00","#E41A1C"), # inspired by brewer.pal(5,"Set1"),
+     use.ggplot = T)
+
+# combine plots
+stacked_plot_from_fit <- ggarrange(plot_exp_from_fit + ggtitle("A. From fit status (no severe infection)"),
+                          plot_un_exp_from_fit + ggtitle("B. From fit status (no severe infection)"),
+                          common.legend = T,
+                          nrow=1,hjust = -0)
+```
+
+```{r stacked_plots_from_mild}
+
+# From mild
+plot_exp_from_mild <- plot(probtrans_exp,from=2,
+     ord=c(2:5),linewidth=2,
+     xlab = "Years since entering mild frailty state at/after index date",
+     ylab = "Probability",
+     cex=0.75,
+     xlim = c(0,6),
+     main="C. From mild frailty (severe infection)",
+     legend = c("Fit","Mild Frailty","Moderate Frailty","Severe Frailty","Death"),
+     legend.pos = "top",
+     cols = c("#377EB8","#984EA3","#8B8B00","#E41A1C"), # inspired by brewer.pal(5,"Set1"),
+     use.ggplot = T)
+
+
+plot_un_exp_from_mild <- plot(probtrans_un_exp,from=2,
+     ord=c(2:5),linewidth=2,
+     xlab = "Years since entering mild frailty state at/after index date",
+     ylab = "Probability",
+     cex=0.75,
+     xlim = c(0,6),
+     main="D. From mild frailty (no severe infection)",
+     legend = c("Fit","Mild Frailty","Moderate Frailty","Severe Frailty","Death"),
+     legend.pos = "top",
+     cols = c("#377EB8","#984EA3","#8B8B00","#E41A1C"), # inspired by brewer.pal(5,"Set1"),
+     use.ggplot = T)
+
+# combine plots
+stacked_plot_from_mild <- ggarrange(plot_exp_from_mild + ggtitle("C. From mild frailty (no severe infection)"),
+                          plot_un_exp_from_mild + ggtitle("D. From mild frailty (no severe infection)"),
+                          common.legend = T,
+                          nrow=1,hjust = -0)
+  
+```
+
+```{r stacked_plots_from_moderate}
+
+# From mild
+plot_exp_from_moderate <- plot(probtrans_exp,from=3,
+     ord=c(3:5),linewidth=2,
+     xlab = "Years since entering moderate frailty state at/after index date",
+     ylab = "Probability",
+     cex=0.75,
+     xlim = c(0,6),
+     main="E. From moderate frailty (severe infection)",
+     legend = c("Fit","Mild Frailty","Moderate Frailty","Severe Frailty","Death"),
+     legend.pos = "top",
+     cols = c("#984EA3","#8B8B00","#E41A1C"), # inspired by brewer.pal(5,"Set1"),
+     use.ggplot = T)
+
+
+
+plot_un_exp_from_moderate <- plot(probtrans_un_exp,from=3,
+     ord=c(3:5),linewidth=2,
+     xlab = "Years since entering moderate frailty state at/after index date",
+     ylab = "Probability",
+     cex=0.75,
+     xlim = c(0,6),
+     main="F. From moderate frailty (no severe infection)",
+     legend = c("Fit","Mild Frailty","Moderate Frailty","Severe Frailty","Death"),
+     legend.pos = "top",
+     cols = c("#984EA3","#8B8B00","#E41A1C"), # inspired by brewer.pal(5,"Set1"),
+     use.ggplot = T)
+
+# combine plots
+stacked_plot_from_moderate <- ggarrange(plot_exp_from_moderate + ggtitle("E. From moderate frailty (no severe infection)"),
+                          plot_un_exp_from_moderate + ggtitle("F. From moderate frailty (no severe infection)"),
+                          common.legend = T,
+                          nrow=1,hjust = -0)
+```
+
+```{r stacked_plots_from_severe}
+
+# From mild
+plot_exp_from_severe <- plot(probtrans_exp,from=4,
+     ord=c(4:5),linewidth=2,
+     xlab = "Years since entering severe frailty state at/after index date",
+     ylab = "Probability",
+     cex=0.75,
+     xlim = c(0,6),
+     main="G. From severe frailty (severe infection)",
+     legend = c("Fit","Mild Frailty","Moderate Frailty","Severe Frailty","Death"),
+     legend.pos = "top",
+     cols = c("#8B8B00","#E41A1C"), # inspired by brewer.pal(5,"Set1"),
+     use.ggplot = T)
+
+
+plot_un_exp_from_severe <- plot(probtrans_un_exp,from=4,
+     ord=c(4:5),linewidth=2,
+     xlab = "Years since entering severe frailty state at/after index date",
+     ylab = "Probability",
+     cex=0.75,
+     xlim = c(0,6),
+     main="H. From severe frailty (no severe infection)",
+     legend = c("Fit","Mild Frailty","Moderate Frailty","Severe Frailty","Death"),
+     legend.pos = "top",
+     cols = c("#8B8B00","#E41A1C"), # inspired by brewer.pal(5,"Set1"),
+     use.ggplot = T) 
+
+# combine plots
+stacked_plot_from_severe <- ggarrange(plot_exp_from_severe + ggtitle("G. From severe frailty (no severe infection)"),
+                          plot_un_exp_from_severe + ggtitle("H. From severe frailty (no severe infection)"),
+                          common.legend = T,
+                          nrow=1,hjust = -0)
+```
+
+```{r combine_all_plots}
+
+# combine plots
+stacked_plots <- ggarrange(plot_exp_from_fit + ggtitle("A. From fit status (severe infection)"),
+                          plot_un_exp_from_fit + ggtitle("B. From fit status (no severe infection)"),
+                          plot_exp_from_mild + ggtitle("C. From mild frailty (severe infection)"),
+                          plot_un_exp_from_mild + ggtitle("D. From mild frailty (no severe infection)"),
+                          plot_exp_from_moderate + ggtitle("E. From moderate frailty (severe infection)"),
+                          plot_un_exp_from_moderate + ggtitle("F. From moderate frailty (no severe infection)"),
+                          plot_exp_from_severe + ggtitle("G. From severe frailty (severe infection)"),
+                          plot_un_exp_from_severe + ggtitle("H. From severe frailty (no severe infection)"),
+                          common.legend = T,
+                          nrow=4,ncol = 2)
+```
+
+```{r mean_state_occupancy_times}
+
+# Expected length of stay in each state; up to 5 years ff-up
+# To use the ELOS() in the mstate package
+# the time is from study start to end of follow-up
+# the ELOS for the absorbing state looks confusing but what it actually means is the expected time since death at study end or the last event time
+
+ELOS(probtrans_exp)
+ELOS(probtrans_un_exp)
+
+round( ELOS(probtrans_exp,tau =5),1)
+round( ELOS(probtrans_un_exp,tau =5),1)
+
+# exposed
+states <- c("Fit","Mild","Moderate","Severe","Death")
+ 
+matrix(ELOS(probtrans_exp,tau =5),nrow = 5,
+        dimnames = list(states,states)) |> 
+  data.frame() |> rownames_to_column() |>
+  mutate(exposed=1,.after=1) |>
+  # un_exposed
+  rbind(matrix(ELOS(probtrans_un_exp,tau =5),nrow = 5,
+        dimnames = list(states,states)) |> 
+  data.frame() |> rownames_to_column() |>
+    mutate(exposed=0,.after=1)) |> 
+  mutate(across(Fit:Death,~round(.x,2))) |>
+  gt(rowname_col = "rowname",caption = "Expected length of stay in the starting states before transitioning (5-years follow-up)")
+```
+
+## Sensitivity analyses
+
+### Adjust main regression models for ethnicity
+```{r all_mstate_cox_ethnicity}
+all_mstate_cox_ethnicity <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_ethnicity,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data =  filter(collect(inf_frailty_cprd_mstate_expcovs),
+                                               if_all(all_of(c(covariates,ethnicity)),~(!is.na(.x) & .x != "Missing"))))
+
+#
+ forestplot_mstate_HRs(model = readRDS("./results/all_mstate_cox_ethnicity.rds"),
+                                            events_exposed = events(filter(inf_frailty_cprd_mstate,
+                                                                           exposed==1,
+                                                                           if_all(all_of(c(covariates,ethnicity)),~(!is.na(.x) & .x != "Missing")))),
+                                            events_un_exposed = events(filter(inf_frailty_cprd_mstate,
+                                                                           exposed==0,
+                                                                           if_all(all_of(c(covariates,ethnicity)),~(!is.na(.x) & .x != "Missing")))),
+                       by_sub_group = F, 
+                       plot_save_name = "Figure_S3_mstate")
+```
+
+### Community acquired infections: redefine severe infections as:
+
+ 1. At least one gp recorded infection diagnostic code on the date of hospital admission or within 7 days prior
+ 2. Any dispensed antimicrobial on the date of hospital admission or within 7 days prior
+ 3. Both 1 and 2
+ 
+```{r comm_inf_setidss}
+#
+comm_inf_setids_1 <- collect(inf_frailty_cprd) |>
+  mutate(setid = as.numeric(factor(setid))) |>
+  group_by(setid) |> 
+  filter(any(gp_infection_7dy_lookback == 1 & exposed ==1)) |>
+  ungroup() |>
+  pull(setid)
+
+#
+
+comm_inf_setids_2 <- collect(inf_frailty_cprd) |>
+  mutate(setid = as.numeric(factor(setid))) |>
+  group_by(setid) |> 
+  filter(any(antibio_7dy_lookbck == 1 & exposed ==1)) |>
+  ungroup() |>
+  pull(setid)
+#
+
+comm_inf_setids_3 <- collect(inf_frailty_cprd) |>
+  mutate(setid = as.numeric(factor(setid))) |>
+  group_by(setid) |> 
+  filter(any(gp_infection_7dy_lookback == 1 & antibio_7dy_lookbck == 1 & exposed ==1)) |>
+  ungroup() |>
+  pull(setid)
+
+```
+
+```{r community_acquired_infections_1}
+all_mstate_cox_comm_inf_1  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),setid %in% comm_inf_setids_1,
+                                               if_all(all_of(covariates),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r community_acquired_infections_2}
+all_mstate_cox_comm_inf_2  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),setid %in% comm_inf_setids_2,
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r community_acquired_infections_3}
+all_mstate_cox_comm_inf_3  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),setid %in% comm_inf_setids_3,
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r forest_plot_comm_inf}
+
+plot_df_comm_inf <- rbind( # prior primary care infection diagnosis
+  extract_model_data(model = readRDS("./results/all_mstate_cox_comm_inf_1.rds"),
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,setid %in% comm_inf_setids_1,exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,setid %in% comm_inf_setids_1,exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 1,sub_group_desc="Primary care infection"),
+  # prior primary care antibiotic prescription
+   extract_model_data(model = readRDS("./results/all_mstate_cox_comm_inf_2.rds"),
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,setid %in% comm_inf_setids_2,exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,setid %in% comm_inf_setids_2,exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 2,sub_group_desc="Primary care antibiotic"),
+  # Both
+  extract_model_data(model = readRDS("./results/all_mstate_cox_comm_inf_3.rds"),
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,setid %in% comm_inf_setids_3,exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,setid %in% comm_inf_setids_3,exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 3,sub_group_desc="Both")) |>
+  arrange(term_description,sub_group) |>
+  mutate(term_description = if_else(duplicated(term_description),NA_character_,term_description)) 
+
+# Plot
+forestplot_mstate_HRs(model = plot_df_comm_inf,
+                      height = 40,clip = 10,width = 32,
+                      plot_save_name = "Figure_S4_mstate",
+                      h_5 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_8 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_11 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_14 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_17 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_20 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_23 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_25 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_28 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2))
+```
+
+### Restrict the study to periods with likely more frequent recording of some of the deficits included in the eFI due to changes to the Quality Outcomes Framework (QOF) indicators and other policy changes over time; 
+
+1) 2012 onwards  
+2) 2014 onwards 
+
+```{r sensitivity_2012_onwards}
+
+all_mstate_cox_2012  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),indexdate >= as.Date("2012-01-01"),
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+```
+
+
+```{r sensitivity_2014_onwards}
+
+all_mstate_cox_2014  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),indexdate >= as.Date("2014-01-01"),
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r forest_plot_qof_periods}
+
+plot_df_qof_periods <- rbind( # prior primary care infection diagnosis
+  extract_model_data(model = all_mstate_cox_2012,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,indexdate >= as.Date("2012-01-01"),exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,indexdate >= as.Date("2012-01-01"),
+                                                                           exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 1,sub_group_desc="2012 onwards"),
+  # prior primary care antibiotic prescription
+   extract_model_data(model = all_mstate_cox_2014,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,indexdate >= as.Date("2014-01-01"),exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,indexdate >= as.Date("2014-01-01"),
+                                                                           exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 2,sub_group_desc="2014 onwards")) |>
+  arrange(term_description,sub_group) |>
+  mutate(term_description = if_else(duplicated(term_description),NA_character_,term_description)) 
+
+# Plot
+forestplot_mstate_HRs(model = plot_df_qof_periods,
+                      height = 40,clip = 10,width=32,
+                      plot_save_name = "Figure_S5_mstate",
+                      h_4 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_6 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_8 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_10 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_12 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_14 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_16 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_18 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_20 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2))
+```
+
+## Secondary analyses: Effect modification
+
+Fit sub group models to explore effect modification by:
+
+- Age group
+- Sex
+- Deprivation quintiles
+- Diabetes
+- Dementia
+- Care home residency
+- Severe infection (exposure) type (bacterial, viral, fungal, parasitic)
+- Severe infection (exposure) site (sepsis,uti,ssti,mening_enceph,lrti,gastro)
+
+### EM Age
+```{r em_age_65_70}
+
+all_mstate_cox_age_65_70  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(grep("age",expanded_covariates_infection_history,value = T,invert=T),c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),age_bl_cat4 == "1.65-70",
+                                               if_all(all_of(c(grep("age",expanded_covariates_infection_history,value = T,invert=T))),~(!is.na(.x) & .x != "Missing"))))
+  
+```
+
+```{r em_age_71_80}
+
+all_mstate_cox_age_71_80  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(grep("age",expanded_covariates_infection_history,value = T,invert=T),
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),age_bl_cat4 == "2.71-80",
+                                               if_all(all_of(c(grep("age",expanded_covariates_infection_history,value = T,invert=T))),~(!is.na(.x) & .x != "Missing"))))
+  
+```
+
+```{r em_age_81_90}
+
+all_mstate_cox_age_81_90 <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(grep("age",expanded_covariates_infection_history,value = T,invert=T),
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),age_bl_cat4 == "3.81-90",
+                                               if_all(all_of(c(grep("age",expanded_covariates_infection_history,value = T,invert=T))),~(!is.na(.x) & .x != "Missing"))))
+  
+```
+
+```{r em_age_90}
+
+all_mstate_cox_age_90 <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(grep("age",expanded_covariates_infection_history,value = T,invert=T),
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),age_bl_cat4 == "4.>90",
+                                               if_all(all_of(c(grep("age",expanded_covariates_infection_history,value = T,invert=T))),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r forest_plot_age}
+
+plot_df_age <- rbind( # Age 65_70
+  extract_model_data(model = all_mstate_cox_age_65_70,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,age_bl_cat4 == "1.65-70",exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,age_bl_cat4 == "1.65-70",exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 1,sub_group_desc="65-70 Years"),
+   # Age 71_80
+  extract_model_data(model = all_mstate_cox_age_71_80,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,age_bl_cat4 == "2.71-80",exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,age_bl_cat4 == "2.71-80",exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 2,sub_group_desc="71-80 Years"),
+   # Age 81_90
+  extract_model_data(model = all_mstate_cox_age_81_90,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,age_bl_cat4 == "3.81-90",exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,age_bl_cat4 == "3.81-90",exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 3,sub_group_desc="81-90 Years"),
+   # Age >90
+  extract_model_data(model = all_mstate_cox_age_90,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,age_bl_cat4 == "4.>90",exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,age_bl_cat4 == "4.>90",exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 4,sub_group_desc=">90 Years")) |>
+  arrange(term_description,sub_group) |>
+  mutate(term_description = if_else(duplicated(term_description),NA_character_,term_description)) 
+
+# Plot
+forestplot_mstate_HRs(model = plot_df_age,
+                      height = 45,clip = 8,width = 32,
+                      plot_save_name = "Figure_S6_mstate",
+                      h_6 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_10 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_14 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_18 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_22 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_26 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_30 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_34 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_38 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2))
+```
+
+### EM sex
+```{r em_sex_female}
+
+all_mstate_cox_female  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(grep("gender",expanded_covariates_infection_history,value = T,invert=T),
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),gender == "Female",
+                                               if_all(all_of(c(grep("gender",expanded_covariates_infection_history,value = T,invert=T))),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r em_sex_male}
+
+all_mstate_cox_male  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(grep("gender",expanded_covariates_infection_history,value = T,invert=T),
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),gender == "Male",
+                                               if_all(all_of(c(grep("gender",expanded_covariates_infection_history,value = T,invert=T))),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r forest_plot_sex}
+
+plot_df_sex <- rbind( # prior primary care infection diagnosis
+  extract_model_data(model = all_mstate_cox_female,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,gender == "Female", exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,gender == "Female",exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 1,sub_group_desc="Female"),
+  # prior primary care antibiotic prescription
+   extract_model_data(model = all_mstate_cox_male,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,gender == "Male", exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,gender == "Male",exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 2,sub_group_desc="Male")) |>
+  arrange(term_description,sub_group) |>
+  mutate(term_description = if_else(duplicated(term_description),NA_character_,term_description)) 
+
+# Plot
+forestplot_mstate_HRs(model = plot_df_sex,
+                      height = 40,width = 32,
+                      plot_save_name = "Figure_S7_mstate",
+                      h_4 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_6 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_8 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_10 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_12 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_14 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_16 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_18 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_20 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2))
+```
+
+### EM Deprivation
+```{r em_dep_1}
+
+all_mstate_cox_dep_1  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(grep("e2019_imd",expanded_covariates_infection_history,value = T,invert=T),
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),e2019_imd == 1,
+                                               if_all(all_of(c(grep("e2019_imd",expanded_covariates_infection_history,value = T,invert=T))),~(!is.na(.x) & .x != "Missing"))))
+  
+```
+
+```{r em_dep_2}
+all_mstate_cox_dep_2  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(grep("e2019_imd",expanded_covariates_infection_history,value = T,invert=T),
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),e2019_imd == 2,
+                                               if_all(all_of(c(grep("e2019_imd",expanded_covariates_infection_history,value = T,invert=T))),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r em_dep_3}
+all_mstate_cox_dep_3  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(grep("e2019_imd",expanded_covariates_infection_history,value = T,invert=T),
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),e2019_imd == 3,
+                                               if_all(all_of(c(grep("e2019_imd",expanded_covariates_infection_history,value = T,invert=T))),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r em_dep_4}
+all_mstate_cox_dep_4  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(grep("e2019_imd",expanded_covariates_infection_history,value = T,invert=T),
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),e2019_imd == 4,
+                                               if_all(all_of(c(grep("e2019_imd",expanded_covariates_infection_history,value = T,invert=T))),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r em_dep_5}
+all_mstate_cox_dep_5  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(grep("e2019_imd",expanded_covariates_infection_history,value = T,invert=T),
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),e2019_imd == 5,
+                                               if_all(all_of(c(grep("e2019_imd",expanded_covariates_infection_history,value = T,invert=T))),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r combine_em_dep}
+
+plot_df_deprivation <- rbind( # IMD 1
+  extract_model_data(model = all_mstate_cox_dep_1.rds,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,e2019_imd == 1,exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,e2019_imd == 1,exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 1,sub_group_desc="IMD 1"),
+   # IMD 2
+  extract_model_data(model = all_mstate_cox_dep_2.rds,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,e2019_imd == 2,exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,e2019_imd == 2,exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 2,sub_group_desc="IMD 2"),
+   # IMD 3
+  extract_model_data(model = all_mstate_cox_dep_3.rds,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,e2019_imd == 3,exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,e2019_imd == 3,exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 3,sub_group_desc="IMD 3"),
+   # IMD 4
+  extract_model_data(model = all_mstate_cox_dep_4.rds,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,e2019_imd == 4,exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,e2019_imd == 4,exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 4,sub_group_desc="IMD 4"),
+# IMD 5
+extract_model_data(model = all_mstate_cox_dep_5.rds,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,e2019_imd == 5,exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,e2019_imd == 5,exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 5,sub_group_desc="IMD 5")) |>
+  arrange(term_description,sub_group) |>
+  mutate(term_description = if_else(duplicated(term_description),NA_character_,term_description)) 
+
+# Plot
+forestplot_mstate_HRs(model = plot_df_deprivation,
+                      height = 60,legend_dist = 0.13,width = 32,
+                      plot_save_name = "Figure_S8_mstate",
+                      h_7 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_12 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_17 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_22 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_27 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_32 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_37 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_42 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_47 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2))
+```
+
+### EM Care home residency
+```{r em_care_home_no}
+all_mstate_cox_care_home_no  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),care_home_residency == 0,
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r em_care_home_yes}
+all_mstate_cox_care_home_yes  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),care_home_residency == 1,
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r combine_em_care_home}
+plot_df_care_home <- rbind( # all_mstate_cox_care_home_no
+  extract_model_data(model = all_mstate_cox_care_home_no,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,care_home_residency == 0, exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,care_home_residency == 0,exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 1,sub_group_desc="Care home: No"),
+  # all_mstate_cox_care_home_yes
+   extract_model_data(model = all_mstate_cox_care_home_yes),
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,care_home_residency == 1, exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,care_home_residency == 1,exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 2,sub_group_desc="Care home: Yes")) |>
+  arrange(term_description,sub_group) |>
+  mutate(term_description = if_else(duplicated(term_description),NA_character_,term_description)) 
+
+# Plot
+forestplot_mstate_HRs(model = plot_df_care_home,
+                      height = 40,width = 32,
+                      plot_save_name = "Figure_S9_mstate",
+                      h_4 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_6 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_8 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_10 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_12 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_14 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_16 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_18 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_20 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2))
+```
+
+### EM Dementia
+```{r em_dementia_no}
+all_mstate_cox_dementia_no  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),dementia == 0,
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+
+```
+
+```{r em_dementia_yes}
+all_mstate_cox_dementia_yes  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),dementia == 1,
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+  
+```
+
+```{r combine_em_dementia}
+plot_df_dementia <- rbind( # prior primary care infection diagnosis
+  extract_model_data(model = all_mstate_cox_dementia_no,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,dementia == 0, exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,dementia == 0,exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 1,sub_group_desc="Dementia: No"),
+  # prior primary care antibiotic prescription
+   extract_model_data(model = all_mstate_cox_dementia_yes,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,dementia == 1, exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,dementia == 1,exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 2,sub_group_desc="Dementia: Yes")) |>
+  arrange(term_description,sub_group) |>
+  mutate(term_description = if_else(duplicated(term_description),NA_character_,term_description)) 
+
+# Plot
+forestplot_mstate_HRs(model = plot_df_dementia,
+                      height = 40,width = 32,
+                      plot_save_name = "Figure_S10_mstate",
+                      h_4 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_6 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_8 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_10 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_12 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_14 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_16 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_18 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_20 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2))
+```
+
+### EM Diabetes
+```{r em_diabetes_no}
+all_mstate_cox_diabetes_no  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),diabetes == 0,
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r em_diabetes_yes}
+all_mstate_cox_diabetes_yes  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,
+                                                                    c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),diabetes == 1,
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r combine_em_diabetes}
+plot_df_diabetes <- rbind( # prior primary care infection diagnosis
+  extract_model_data(model = all_mstate_cox_diabetes_no,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,diabetes == 0, exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,diabetes == 0,exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 1,sub_group_desc="Diabetes: No"),
+  # prior primary care antibiotic prescription
+   extract_model_data(model = all_mstate_cox_diabetes_yes,
+                     events_exposed = events(filter(inf_frailty_cprd_mstate,diabetes == 1, exposed==1,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     events_un_exposed = events(filter(inf_frailty_cprd_mstate,diabetes == 1,exposed==0,
+                                                                           if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 2,sub_group_desc="Diabetes: Yes")) |>
+  arrange(term_description,sub_group) |>
+  mutate(term_description = if_else(duplicated(term_description),NA_character_,term_description)) 
+
+# Plot
+forestplot_mstate_HRs(model = plot_df_diabetes,
+                      height = 40,width = 32,
+                      plot_save_name = "Figure_S11_mstate",
+                      h_4 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_6 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_8 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_10 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_12 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_14 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_16 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_18 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_20 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2))
+```
+
+
+### EM infection pathogen 
+```{r em_bacterial}
+all_mstate_cox_bacterial  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),inf_type_of_match_grp == "bacterial",
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+
+```
+
+```{r em_viral}
+all_mstate_cox_viral  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),inf_type_of_match_grp == "viral",
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r em_fungal}
+all_mstate_cox_fungal  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),inf_type_of_match_grp == "fungal",
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r em_parasitic}
+all_mstate_cox_parasitic  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),inf_type_of_match_grp == "parasitic",
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+```
+
+```{r combine_em_pathogen}
+plot_df_inf_pathogen <- rbind( # inf_pathogen 65_70
+  extract_model_data( model = all_mstate_cox_bacterial,
+  events_exposed = events(filter(inf_frailty_cprd_mstate,inf_type_of_match_grp == "bacterial",exposed==1,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+  events_un_exposed = events(filter(inf_frailty_cprd_mstate,inf_type_of_match_grp == "bacterial",exposed==0,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 1,sub_group_desc="Bacterial"),
+   # inf_pathogen 71_80
+  extract_model_data( model = all_mstate_cox_viral,
+  events_exposed = events(filter(inf_frailty_cprd_mstate,inf_type_of_match_grp == "viral",exposed==1,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+  events_un_exposed = events(filter(inf_frailty_cprd_mstate,inf_type_of_match_grp == "viral",exposed==0,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 2,sub_group_desc="Viral"),
+   # inf_pathogen 81_90
+  extract_model_data( model = all_mstate_cox_fungal,
+  events_exposed = events(filter(inf_frailty_cprd_mstate,inf_type_of_match_grp == "fungal",exposed==1,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+  events_un_exposed = events(filter(inf_frailty_cprd_mstate,inf_type_of_match_grp == "fungal",exposed==0,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 3,sub_group_desc="Fungal"),
+   # inf_pathogen >90
+  extract_model_data( model = all_mstate_cox_parasitic,
+  events_exposed = events(filter(inf_frailty_cprd_mstate,inf_type_of_match_grp == "parasitic",exposed==1,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+  events_un_exposed = events(filter(inf_frailty_cprd_mstate,inf_type_of_match_grp == "parasitic",exposed==0,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+                     sub_group_level = 4,sub_group_desc="Parasitic")) |>
+  arrange(term_description,sub_group) |>
+  mutate(term_description = if_else(duplicated(term_description),NA_character_,term_description)) 
+
+# Plot
+forestplot_mstate_HRs(model = plot_df_inf_pathogen,
+                      height = 45,clip=10,width = 32,
+                      plot_save_name = "Figure_S12_mstate",
+                      h_6 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_10 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_14 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_18 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_22 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_26 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_30 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_34 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2),
+                      h_38 = gpar(col = "black", columns = 1:5, lty = "solid",lwd=2))
+```
+
+### EM infection type
+
+```{r em_sepsis}
+all_mstate_cox_sepsis  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),inf_site_of_match_grp == "sepsis",
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+  
+#
+forestplot_mstate_HRs(model = all_mstate_cox_sepsis,
+                                            events_exposed = events(filter(inf_frailty_cprd_mstate,inf_site_of_match_grp == "sepsis",exposed==1,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+                                            events_un_exposed = events(filter(inf_frailty_cprd_mstate,inf_site_of_match_grp == "sepsis",exposed==0,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+                                            plot_save_name = "forest_plot_sepsis")
+```
+
+```{r em_uti}
+all_mstate_cox_uti  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),inf_site_of_match_grp == "uti",
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+
+  
+#
+forestplot_mstate_HRs(model = all_mstate_cox_uti,
+                                            events_exposed = events(filter(inf_frailty_cprd_mstate,inf_site_of_match_grp == "uti",exposed==1,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+                                            events_un_exposed = events(filter(inf_frailty_cprd_mstate,inf_site_of_match_grp == "uti",exposed==0,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+                                            plot_save_name = "forest_plot_uti")
+```
+
+```{r em_ssti}
+all_mstate_cox_ssti  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),inf_site_of_match_grp == "ssti",
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+  
+#
+forestplot_mstate_HRs(model = all_mstate_cox_ssto,
+                                            events_exposed = events(filter(inf_frailty_cprd_mstate,inf_site_of_match_grp == "ssti",exposed==1,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+                                            events_un_exposed = events(filter(inf_frailty_cprd_mstate,inf_site_of_match_grp == "ssti",exposed==0,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+                                            plot_save_name = "forest_plot_ssti")
+```
+
+```{r em_lrti}
+all_mstate_cox_lrti  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),inf_site_of_match_grp == "lrti",
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+  
+#
+forestplot_mstate_HRs(model = all_mstate_cox_lrti,
+                                            events_exposed = events(filter(inf_frailty_cprd_mstate,inf_site_of_match_grp == "lrti",exposed==1,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+                                            events_un_exposed = events(filter(inf_frailty_cprd_mstate,inf_site_of_match_grp == "lrti",exposed==0,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+                                            plot_save_name = "forest_plot_lrti")
+```
+
+```{r em_mening_enceph}
+all_mstate_cox_mening_enceph  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                  c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                 method = "breslow",
+                                 data = filter(collect(inf_frailty_cprd_mstate_expcovs),inf_site_of_match_grp == "mening_enceph",
+                                               if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+  
+#
+forestplot_mstate_HRs(model = all_mstate_cox_mening_enceph,
+                                            events_exposed = events(filter(inf_frailty_cprd_mstate,inf_site_of_match_grp == "mening_enceph",exposed==1,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+                                            events_un_exposed = events(filter(inf_frailty_cprd_mstate,inf_site_of_match_grp == "mening_enceph",exposed==0,
+                                                                           if_all(all_of(c(covariates)),
+                                                                                  ~(!is.na(.x) & .x != "Missing")))),
+                                            plot_save_name = "forest_plot_mening_enceph")
+```
+
+# For gastro:
+**Warning message:In grep(c("age", "harmful_alcohol_use"), expanded_covariates_infection_history) :argument 'pattern' has length > 1 and only the first element will be used**
+
+# There is perfect success prediction for age_bl_cat43.6 (81-90) harmful_alcohol_use.6 in transition 6
+# So to remove variables only for that transition
+
+  
+```{r em_gastro}
+all_mstate_cox_gastro  <- coxph(as.formula(paste("Surv(Tstart,Tstop,status)","~",
+                                                        c(glue_collapse(c(expanded_covariates_infection_history,c("strata(trans)","cluster(setid)")),sep = "+")))),
+                                       method = "breslow",
+                                       data = filter(collect(inf_frailty_cprd_mstate_expcovs),inf_site_of_match_grp == "gastro",
+                                                     if_all(all_of(c(covariates)),~(!is.na(.x) & .x != "Missing"))))
+
+#
+forestplot_mstate_HRs(model = all_mstate_cox_gastro,
+                      events_exposed = events(filter(inf_frailty_cprd_mstate,inf_site_of_match_grp == "gastro",exposed==1,
+                                                     if_all(all_of(c(covariates)),
+                                                            ~(!is.na(.x) & .x != "Missing")))),
+                      events_un_exposed = events(filter(inf_frailty_cprd_mstate,inf_site_of_match_grp == "gastro",exposed==0,
+                                                        if_all(all_of(c(covariates)),
+                                                               ~(!is.na(.x) & .x != "Missing")))),
+                      plot_save_name = "forest_plot_gastro")
+
+```
